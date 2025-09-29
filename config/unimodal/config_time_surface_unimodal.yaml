@@ -31,6 +31,8 @@ base_channels: 32
 channel_multipliers: [1, 2, 4, 8]
 drop_path_rate: 0.1
 use_grn: True
+save_skips: True
+pooling_method: 'none'
 
 ##################### Optimizers and Loss Functions #####################
 weight_decay: 1e-6 # Default L2 Regularization

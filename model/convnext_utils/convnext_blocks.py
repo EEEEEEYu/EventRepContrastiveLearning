@@ -36,6 +36,91 @@ class GRN(nn.Module):
         nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x
 
+class GeMPool2d(nn.Module):
+    """
+    Generalized Mean Pooling.
+    GeM(x) = (1/|Ω| sum_{i in Ω} x_i^p )^(1/p)
+    where p is learnable (per-channel or shared).
+    """
+    def __init__(self, p: float = 3.0, eps: float = 1e-6, learnable_p: bool = True):
+        super().__init__()
+        if learnable_p:
+            self.p = nn.Parameter(torch.ones(1) * p)
+        else:
+            self.register_buffer("p", torch.tensor(p))
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        x = x.clamp(min=self.eps)
+        return F.avg_pool2d(x.pow(self.p), (x.size(-2), x.size(-1))).pow(1.0 / self.p)
+
+
+class PoolingBlock(nn.Module):
+    """
+    Supports four pooling methods:
+    - "avg": average pooling
+    - "max": max pooling
+    - "conv": convolution-based pooling
+    - "gem": generalized mean pooling (global only)
+
+    Args:
+        pooling_method: str, one of {"avg", "max", "conv", "gem"}
+        pooling_channels: list[int], used in conv mode (out channels per layer).
+                          For avg/max/gem this can be dummy list of same length.
+        pooling_strides: list[int], stride per pooling layer
+        pooling_kernel_size: list[int], kernel size per pooling layer
+        in_channels: int, required for conv pooling
+        gem_p: float, initial value of p for GeM
+        gem_learn_p: bool, whether p is learnable in GeM
+    """
+    def __init__(self, pooling_method: str,
+                 pooling_channels: list,
+                 pooling_strides: list,
+                 pooling_kernel_size: list,
+                 in_channels: int,
+                 gem_p: float = 3.0,
+                 gem_learn_p: bool = True):
+        super().__init__()
+        assert pooling_method in ["avg", "max", "conv", "gem"], \
+            f"Unsupported pooling_method {pooling_method}"
+        assert len(pooling_channels) == len(pooling_strides) == len(pooling_kernel_size), \
+            "pooling_channels, strides, and kernel_size must have same length"
+
+        self.method = pooling_method
+        self.num_layers = len(pooling_channels)
+
+        layers = []
+        current_in = in_channels
+
+        if self.method == "gem":
+            # Only one global pooling at the end
+            assert self.num_layers == 1, "GeM pooling only supports one global layer"
+            layers.append(GeMPool2d(p=gem_p, learnable_p=gem_learn_p))
+        else:
+            for i in range(self.num_layers):
+                stride = pooling_strides[i]
+                ksize = pooling_kernel_size[i]
+
+                if self.method == "avg":
+                    layers.append(nn.AvgPool2d(kernel_size=ksize, stride=stride))
+                elif self.method == "max":
+                    layers.append(nn.MaxPool2d(kernel_size=ksize, stride=stride))
+                elif self.method == "conv":
+                    out_ch = pooling_channels[i]
+                    layers.append(nn.Conv2d(current_in, out_ch,
+                                            kernel_size=ksize,
+                                            stride=stride,
+                                            padding=0,
+                                            bias=False))
+                    layers.append(nn.BatchNorm2d(out_ch))
+                    layers.append(nn.GELU())
+                    current_in = out_ch
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
 
 class DropPath(nn.Module):
     """Stochastic depth per sample (from timm)."""
@@ -165,6 +250,13 @@ class ConvNeXtEncoder(nn.Module):
         drop_path_rate: float = 0.1,
         use_grn: bool = False,
         save_skips: bool = True,
+        pooling_method: str = 'conv',
+        pooling_channels: List[int] = [128, 256],
+        pooling_kernel_size: List[int| Tuple[int, int]] = [2, 2],
+        pooling_strides: List[int| Tuple[int, int]] = [2, 2],
+        gem_pooling_p: float = 3.0,
+        gem_pooling_learnable_p: bool = True,
+        final_latent_embedding_dim: int = 2048,
     ):
         super().__init__()
         H, W = in_size
@@ -214,7 +306,32 @@ class ConvNeXtEncoder(nn.Module):
         # Final channel projection to out_channels (latent C')
         self.out_proj = nn.Conv2d(curr_dim, out_channels, kernel_size=1)
 
+        # Global embedding projection
+        if pooling_method != 'none':
+            self.pooling_block = PoolingBlock(
+                pooling_method=pooling_method,
+                pooling_channels=pooling_channels,
+                pooling_strides=pooling_strides,
+                pooling_kernel_size=pooling_kernel_size,
+                in_channels=out_channels,
+                gem_p=gem_pooling_p,
+                gem_learn_p=gem_pooling_learnable_p,
+            )
+
+            # We assume stride and kernel size are all 2
+            flattened_dim = (target_size[0] // (2 ** len(pooling_strides))) * (target_size[1] // (2 ** len(pooling_strides))) * pooling_channels[-1]
+
+            self.global_embedding_layers = nn.Sequential(
+                nn.Linear(flattened_dim, final_latent_embedding_dim),
+                nn.ReLU(),
+                nn.Linear(final_latent_embedding_dim, final_latent_embedding_dim)
+            )
+        else:
+            self.pooling_block = None
+            self.global_embedding_layers = None
+
     def forward(self, x):
+        B, *_ = x.shape
         x = self.in_proj(x)
         if self.save_skips:
             skips = []
@@ -225,7 +342,14 @@ class ConvNeXtEncoder(nn.Module):
             if self.save_skips:
                 skips.append(x)
         x = self.out_proj(x)
-        return x, skips if self.save_skips else None
+
+        if self.pooling_block is not None:
+            e = self.pooling_block(x)
+            e = e.reshape(B, -1)
+            e = self.global_embedding_layers(e)
+        else:
+            e = None
+        return x, e, skips if self.save_skips else None
         
 
 # -----------------------------
@@ -279,16 +403,19 @@ class ConvNeXtAutoEncoder(nn.Module):
     - Decoder reconstructs to input size (via skips)
     """
     def __init__(self,
-                 in_channels: int,
-                 in_size: Tuple[int, int],
-                 target_size: Tuple[int, int],
-                 latent_channels: int = 64,
-                 out_channels: int = None,
-                 stage_depths: List[int] = (3,3,9,3),
-                 base_channels: int = 32,
-                 channel_multipliers: List[int] = (1,2,4,8),
-                 drop_path_rate: float = 0.1,
-                 use_grn: bool = True):
+                in_channels: int,
+                in_size: Tuple[int, int],
+                target_size: Tuple[int, int],
+                latent_channels: int = 64,
+                out_channels: int = None,
+                stage_depths: List[int] = (3,3,9,3),
+                base_channels: int = 32,
+                channel_multipliers: List[int] = (1,2,4,8),
+                drop_path_rate: float = 0.1,
+                use_grn: bool = True,
+                save_skips: bool = True,
+                pooling_method: str = 'none',
+            ):
         super().__init__()
         self.encoder = ConvNeXtEncoder(
             in_channels=in_channels,
@@ -299,7 +426,9 @@ class ConvNeXtAutoEncoder(nn.Module):
             base_channels=base_channels,
             channel_multipliers=channel_multipliers,
             drop_path_rate=drop_path_rate,
-            use_grn=use_grn
+            use_grn=use_grn,
+            save_skips=save_skips,
+            pooling_method=pooling_method
         )
         # Infer skip dims by running a dummy spec or deterministically from config
         skip_dims = [base_channels * channel_multipliers[0]] + [base_channels * m for m in channel_multipliers][:len(self.encoder.stages)]
@@ -312,12 +441,12 @@ class ConvNeXtAutoEncoder(nn.Module):
         )
 
     def forward(self, x):
-        latent, skips = self.encoder(x)
+        latent, _, skips = self.encoder(x)
         recon = self.decoder(latent, skips)
         return latent, recon
     
 
-def main():
+def autoencoder_test():
     model = ConvNeXtAutoEncoder(
         in_channels=10,
         in_size=(640, 480),
@@ -336,5 +465,33 @@ def main():
     latent, recon = model(test_input)
     print(f"latent.shape: {latent.shape} recon.shape: {recon.shape}")
 
+def encoder_test():
+    encoder = ConvNeXtEncoder(
+        in_channels=10,
+        out_channels=64,
+        in_size=[640, 480],
+        target_size=[20, 15],
+        stage_depths=(3, 3, 9, 3),
+        base_channels=32,
+        channel_multipliers=[1, 2, 4, 8],
+        drop_path_rate=0.1,
+        use_grn=0.1,
+        save_skips=False,
+        pooling_method='conv',
+        pooling_channels=[128, 256],
+        pooling_kernel_size=[2, 2],
+        pooling_strides=[2, 2],
+        gem_pooling_p=3.0,
+        gem_pooling_learnable_p=True,
+        final_latent_embedding_dim=2048,
+    )
+
+    B, C, H, W = 5, 10, 640, 480
+    test_input = torch.randn((B, C, H, W))
+    latent, embedding, _ = encoder(test_input)
+    print(f"latent.shape: {latent.shape} global_embedding shape: {embedding.shape}")
+
+
 if __name__ == '__main__':
-    main()
+    # autoencoder_test()
+    encoder_test()
