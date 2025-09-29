@@ -22,6 +22,9 @@ from utils.metrics.classification import top1_accuracy, top5_accuracy
 from loss.contrastive_learning import cross_entropy_loss
 from typing import Callable, Dict, Tuple
 
+from loss.contrastive_learning import global_multipos_info_nce, dense_info_nce
+from loss.reconstruction import recon_loss
+
 
 class ModelInterface(pl.LightningModule):
     def __init__(self, **kwargs):
@@ -29,9 +32,24 @@ class ModelInterface(pl.LightningModule):
         self.save_hyperparameters()
         self.model = self.__load_model()
         self.loss_function = self.__configure_loss()
-        self.train_epoch_output = []
-        self.val_epoch_output = []
-        self.test_epoch_output = []
+
+        # Parse model type
+        self.model_class_name = str(self.hparams.model_class_name)
+        if self.model_class_name != 'unimodal':
+            self.global_CL_lambda = float(self.hparams.global_CL_lambda)
+            self.global_multipos_info_nce_temperature = float(self.hparams.global_multipos_info_nce_temperature)
+            self.global_multipos_info_nce_eps = float(self.hparams.global_multipos_info_nce_eps)
+            self.dense_CL_lambda = float(self.hparams.dense_CL_lambda)
+            self.dense_info_nce_temperature = float(self.dense_info_nce_temperature)
+            self.dense_info_nce_include_spatial_negatives = bool(self.hparams.dense_info_nce_include_spatial_negatives)
+            self.dense_info_nce_neighborhood = int(self.hparams.dense_info_nce_neighborhood)
+            self.dense_info_nce_eps = float(self.hparams.dense_info_nce_eps)
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.global_multipos_info_nce_temperature} type: {type(self.hparams.global_multipos_info_nce_temperature)} parsed: {self.hparams.global_multipos_info_nce_temperature}')
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.global_multipos_info_nce_eps} type: {type(self.hparams.global_multipos_info_nce_eps)} parsed: {self.hparams.global_multipos_info_nce_eps}')
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_temperature} type: {type(self.hparams.dense_info_nce_temperature)} parsed: {self.hparams.dense_info_nce_temperature}')
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_include_spatial_negatives} type: {type(self.hparams.dense_info_nce_include_spatial_negatives)} parsed: {self.hparams.dense_info_nce_include_spatial_negatives}')
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_neighborhood} type: {type(self.hparams.dense_info_nce_neighborhood)} parsed: {self.hparams.dense_info_nce_neighborhood}')
+            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_eps} type: {type(self.hparams.dense_info_nce_eps)} parsed: {self.hparams.dense_info_nce_eps}')
 
     def forward(self, x):
         return self.model(x)
@@ -40,77 +58,75 @@ class ModelInterface(pl.LightningModule):
     # check document: https://lightning.ai/docs/pytorch/LTS/common/lightning_module.html
     # Epoch level training logging
     def on_train_epoch_end(self):
-        train_top1_acc = top1_accuracy(self.train_epoch_output)
-        train_top5_acc = top5_accuracy(self.train_epoch_output)
-
-        # Metrics logging. If on_step=True, lightning will log this metric with a '_step' suffix.
-        # If on_epoch=True, lightning will by default use mean reduction to aggregate step metrics and
-        # log this metric with a '_epoch' suffix
-        self.log('train_top1_accuracy', train_top1_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_top5_accuracy', train_top5_acc, on_step=False, on_epoch=True, prog_bar=True)
-
-        del self.train_epoch_output
-        self.train_epoch_output = []
+        pass
 
     # Epoch level validation logging
     def on_validation_epoch_end(self):
-        val_top1_acc = top1_accuracy(self.val_epoch_output)
-        val_top5_acc = top5_accuracy(self.val_epoch_output)
-
-        # Metrics logging. If on_step=True, lightning will log this metric with a '_step' suffix.
-        # If on_epoch=True, lightning will by default use mean reduction to aggregate step metrics and
-        # log this metric with a '_epoch' suffix
-        self.log('val_top1_accuracy', val_top1_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_top5_accuracy', val_top5_acc, on_step=False, on_epoch=True, prog_bar=True)
-
-        del self.val_epoch_output
-        self.val_epoch_output = []
+        pass
 
     # Epoch level testing logging
     def on_test_epoch_end(self):
-        test_top1_acc = top1_accuracy(self.test_epoch_output)
-        test_top5_acc = top5_accuracy(self.test_epoch_output)
-
-        # Metrics logging. If on_step=True, lightning will log this metric with a '_step' suffix.
-        # If on_epoch=True, lightning will by default use mean reduction to aggregate step metrics and
-        # log this metric with a '_epoch' suffix
-        self.log('test_top1_accuracy', test_top1_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('test_top5_accuracy', test_top5_acc, on_step=False, on_epoch=True, prog_bar=True)
-
-        del self.test_epoch_output
-        self.test_epoch_output = []
+        pass
 
     # Caution: self.model.train() is invoked
     def training_step(self, batch, batch_idx):
         train_input, train_labels = batch
         train_out = self(train_input)
-        train_loss = self.loss_function(train_out, train_labels, 'train')
+        train_loss_dict = self.loss_function(train_out, train_labels, 'val')
+        loss_train = train_loss_dict['loss']
 
-        train_step_output = {
-            'loss': train_loss,
-            'pred': train_out,
-            'ground_truth': train_labels
+        # Metrics
+        pos_sim_mean = train_loss_dict['pos_sim_mean']
+        neg_sim_mean = train_loss_dict['neg_sim_mean']
+        self.log('train_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+
+        return {
+            'loss': loss_train
         }
-
-        self.train_epoch_output.append(train_step_output)
-
-        return train_step_output
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def validation_step(self, batch, batch_idx):
-        val_input, val_labels = batch
-        val_out = self(val_input)
-        val_loss = self.loss_function(val_out, val_labels, 'val')
+        if self.model_class_name == 'unimodal':
+            # TODO: add specific transformations for each representation, if necessary
+            val_input = batch
+            val_out = self(val_input)
+            val_recon_loss = self.loss_function(val_out, val_input)
+            self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            # TODO: add PSNR & LPIPS metrics
+            # TODO: which embedding to use for the full autoencoder?
+            
+            
+        elif self.model_class_name == 'pairwise':
+            # TODO: add specific transformations for each representation, if necessary
+            val_input, val_labels = batch
+            val_out_dict = self(val_input)
+            repr1_feature_map = val_out_dict['repr1_feature_map']
+            repr2_feature_map = val_out_dict['repr2_feature_map']
+            stacked_feature_map = torch.concat([repr1_feature_map.unsqueeze(1), repr2_feature_map.unsqueeze(1)], dim=1)
+            repr1_embedding = val_out_dict['repr1_embedding']
+            repr2_embedding = val_out_dict['repr2_embedding']
+            stacked_embedding = torch.concat([repr1_embedding.unsqueeze(1), repr2_embedding.unsqueeze(1)], dim=1)
+            val_loss_dict = self.loss_function(stacked_embedding, stacked_feature_map)
 
-        val_step_output = {
-            'loss': val_loss,
-            'pred': val_out,
-            'ground_truth': val_labels
-        }
+            loss_val = val_loss_dict['total_loss']
+            self.log('val_CL_loss', loss_val.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_global_CL_loss', val_loss_dict['global_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_dense_CL_loss', val_loss_dict['dense_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
 
-        self.val_epoch_output.append(val_step_output)
+            # Metrics
+            global_pos_sim_mean = val_loss_dict['global_pos_sim_mean']
+            global_neg_sim_mean = val_loss_dict['global_neg_sim_mean']
+            dense_pos_sim_mean = val_loss_dict['dense_pos_sim_mean']
+            dense_neg_sim_mean = val_loss_dict['dense_neg_sim_mean']
+            self.log('val_global_pos_sim_mean', global_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_global_neg_sim_mean', global_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_dense_pos_sim_mean', dense_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_dense_neg_sim_mean', dense_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
 
-        return val_step_output
+            return {
+                'loss': loss_val
+            }
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def test_step(self, batch, batch_idx):
@@ -158,18 +174,40 @@ class ModelInterface(pl.LightningModule):
         return [optimizer], [scheduler]
 
     def __configure_loss(self):
-        def loss_func(preds, labels, stage):
-            # Calculate and log each component individually
-            CE_loss = 1.0 * cross_entropy_loss(pred=preds, gt=labels)
-            self.log(f'{stage}_CE_loss', CE_loss, on_step=True, on_epoch=True, prog_bar=True)
+        def unimodal_loss_func(preds, labels):
+            return recon_loss(pred=preds, gt=labels)
 
-            # Log the final compound loss
-            final_loss = CE_loss
-            self.log(f'{stage}_loss', final_loss, on_step=True, on_epoch=True, prog_bar=True)
+        def contrastive_loss_func(embeddings, feature_maps):
+            global_CL_loss_dict = global_multipos_info_nce(
+                z=embeddings, 
+                temperature=self.global_multipos_info_nce_temperature, 
+                eps=self.global_multipos_info_nce_eps
+            )
+            dense_CL_loss_dict = dense_info_nce(
+                maps=feature_maps, 
+                temperature=self.dense_info_nce_temperature, 
+                include_spatial_negatives=self.dense_info_nce_include_spatial_negatives, 
+                neighborhood=self.dense_info_nce_neighborhood, 
+                eps=self.dense_info_nce_eps
+            )
 
-            return final_loss
+            total_loss = self.global_CL_lambda * global_CL_loss_dict['loss'] + self.dense_CL_lambda * dense_CL_loss_dict['loss']
 
-        return loss_func
+            return {
+                'global_CL_loss': global_CL_loss_dict['loss'],
+                'global_pos_sim_mean': global_CL_loss_dict['pos_sim_mean'],
+                'global_neg_sim_mean': global_CL_loss_dict['neg_sim_mean'],
+                'dense_CL_loss': dense_CL_loss_dict['loss'],
+                'dense_pos_sim_mean': dense_CL_loss_dict['pos_sim_mean'],
+                'dense_neg_sim_mean': dense_CL_loss_dict['neg_sim_mean'],
+                'total_loss': total_loss
+            }
+
+
+        if self.model_class_name == 'unimodal':
+            return unimodal_loss_func
+        else:
+            return contrastive_loss_func
 
     def __load_model(self):
         name = self.hparams.model_class_name

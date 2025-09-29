@@ -50,7 +50,12 @@ class Pairwise(nn.Module):
         )
 
     def forward(self, repr1, repr2):
-        repr1_latent, _ = self.encoder1(repr1)
-        repr2_latent, _ = self.encoder2(repr2)
+        repr1_feature_map, repr1_embedding, _ = self.encoder1(repr1)
+        repr2_feature_map, repr2_embedding, _ = self.encoder2(repr2)
 
-        return repr1_latent, repr2_latent
+        return {
+            'repr1_feature_map': repr1_feature_map, 
+            'repr1_embedding': repr1_embedding,
+            'repr2_feature_map': repr2_feature_map,
+            'repr2_embedding': repr2_embedding
+        }

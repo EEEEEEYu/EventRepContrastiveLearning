@@ -330,6 +330,14 @@ class ConvNeXtEncoder(nn.Module):
             self.pooling_block = None
             self.global_embedding_layers = None
 
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze(self):
+        for param in self.parameters():
+            param.requires_grad = True
+
     def forward(self, x):
         B, *_ = x.shape
         x = self.in_proj(x)
@@ -439,6 +447,18 @@ class ConvNeXtAutoEncoder(nn.Module):
             block_depth=2,
             use_grn=use_grn
         )
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze(self):
+        for param in self.parameters():
+            param.requires_grad = True
+
+    def encoder_forward(self, x):
+        latent, _, _ = self.encoder
+        return latent
 
     def forward(self, x):
         latent, _, skips = self.encoder(x)

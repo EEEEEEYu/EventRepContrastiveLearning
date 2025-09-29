@@ -34,6 +34,12 @@ class Unimodal(nn.Module):
             use_grn=use_grn,
         )
 
+    def encoder_forward(self, x):
+        return self.autoencoder.encoder_forward(x)
+
     def forward(self, x):
         latent, x_hat = self.autoencoder(x)
-        return latent, x_hat
+        return {
+            'latent': latent,
+            'x_hat': x_hat,
+        }

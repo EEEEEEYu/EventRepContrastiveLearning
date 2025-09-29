@@ -105,7 +105,11 @@ def global_multipos_info_nce(
         pos_sim_mean = sim[pos_mask].mean() if pos_mask.any() else torch.tensor(0., device=z.device)
         neg_sim_mean = sim[neg_mask].mean() if neg_mask.any() else torch.tensor(0., device=z.device)
 
-    return loss, {'pos_sim_mean': pos_sim_mean.item(), 'neg_sim_mean': neg_sim_mean.item()}
+    return {
+        'loss': loss,
+        'pos_sim_mean': pos_sim_mean.item(), 
+        'neg_sim_mean': neg_sim_mean.item(),
+    }
 
 
 def dense_info_nce(
@@ -226,4 +230,8 @@ def dense_info_nce(
         pos_sim_mean = sim_full[pos_rows].mean() if pos_rows.any() else torch.tensor(0., device=maps.device)
         neg_sim_mean = sim_full[neg_rows].mean() if neg_rows.any() else torch.tensor(0., device=maps.device)
 
-    return loss, {'pos_sim_mean': pos_sim_mean.item(), 'neg_sim_mean': neg_sim_mean.item()}
+    return {
+        'loss': loss,
+        'pos_sim_mean': pos_sim_mean.item(), 
+        'neg_sim_mean': neg_sim_mean.item()
+    }
