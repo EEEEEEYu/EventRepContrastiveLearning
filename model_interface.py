@@ -19,7 +19,7 @@ import torch.optim.lr_scheduler as lrs
 import lightning.pytorch as pl
 
 from utils.metrics.classification import top1_accuracy, top5_accuracy
-from loss.loss_funcs import cross_entropy_loss
+from loss.contrastive_learning import cross_entropy_loss
 from typing import Callable, Dict, Tuple
 
 
