@@ -26,7 +26,7 @@ from loss.contrastive_learning import global_multipos_info_nce, dense_info_nce
 from loss.reconstruction import recon_loss
 
 
-class ModelInterface(pl.LightningModule):
+class DownStreamModelInterface(pl.LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters()

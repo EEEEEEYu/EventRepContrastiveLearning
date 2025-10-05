@@ -26,7 +26,8 @@ from lightning.pytorch.callbacks import RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from rich.table import Table
 
-from model_interface import ModelInterface
+from contrastive_model_interface import ContrastiveLearningModelInterface
+from downstream_model_interface import DownStreamModelInterface
 from data_interface import DataInterface
 from utils.logging import get_resume_info
 
@@ -158,13 +159,17 @@ def main(config):
 
     if (mode == 'warmstart') and ckpt_path:
         # Load only weights; start from epoch 0 and new global_step
-        model_module = ModelInterface.load_from_checkpoint(
+        model_module = ContrastiveLearningModelInterface.load_from_checkpoint(
             ckpt_path, strict=strict_sd, map_location=map_loc, **config
         )
         ckpt_for_trainer_fit = None
     else:
         # Fresh module; if mode == 'resume', Trainer will restore full state via ckpt_path
-        model_module = ModelInterface(**config)
+        if 'is_downstream_task' in config and config['is_downstream_task'] is True:
+            model_module = DownStreamModelInterface(**config)
+        else:
+            model_module = ContrastiveLearningModelInterface(**config)
+
         ckpt_for_trainer_fit = ckpt_path if (mode == 'resume') else None
 
     # --- Data & model
@@ -198,6 +203,8 @@ if __name__ == '__main__':
                         help='Warm-start weights only (do not restore optimizer/scheduler/global_step).')
     parser.add_argument('--strict_state_dict', action='store_true',
                         help='If set (default True), require exact state_dict match when warm-starting.')
+    parser.add_argument('--is_downstream_task', action='store_true',
+                        help="If true, this is a downstream training task. Otherwise it's contrastive learning task")
     parser.add_argument('--map_location', default=None, type=str, required=False,
                         help='Optional map_location for warm-start loading, e.g., "cpu", "cuda".')
 
