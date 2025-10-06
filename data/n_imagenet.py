@@ -103,9 +103,14 @@ class NImageNet(Dataset):
 
 
 if __name__ == "__main__":
-    dataset = NImageNet("/Users/haowenyu/Desktop/N-ImageNet", split="train")
+    dataset = NImageNet("/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/N_Imagenet", split="train")
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=1)
 
-    for events_t, events_xy, events_p, class_id in loader:
-        print(f"t shape: {events_t[0].shape}, xy shape: {events_xy[0].shape}, p shape: {events_p[0].shape}, class_id: {class_id}")
+    for batch in loader:
+        events_t = batch['events_t']
+        events_xy = batch['events_xy']
+        events_p = batch['events_p']
+        class_id = batch['label']
+        path = batch['path']
+        print(f"t shape: {events_t[0].shape}, xy shape: {events_xy[0].shape}, p shape: {events_p[0].shape}, class_id: {class_id}", f"path: {path}")
         break

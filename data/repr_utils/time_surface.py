@@ -180,7 +180,7 @@ class TimeSurface(data.Dataset):
         normalize: str = 'None',
     ):
         self.dataset_dir = dataset_dir
-        self.preprocessor = Preprocessor(dataset_dir=dataset_dir, height=height, width=width)
+        self.preprocessor = Preprocessor(dataset_dir=dataset_dir, split=purpose)
         self.height = height
         self.width = width
         self.use_polarity = use_polarity
@@ -210,25 +210,19 @@ class TimeSurface(data.Dataset):
     def __getitem__(self, idx):
         item_dict = self.preprocessor[idx]
         events_t, events_xy, events_p, label, path = item_dict['events_t'], item_dict['events_xy'], item_dict['events_p'], item_dict['label'], item_dict['path']
-        # print("Class name:", class_name)
-        # print("Auxiliary info:", auxiliary_info)
 
         # Build cache path
-        seq_folder = item_dict['sequence_folder']
+        seq_folder = item_dict['path']
         rel_seq_path = os.path.relpath(seq_folder, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'time_surface')
-        cache_name = f"timesurface_tau{self.tau}_ds{self.events_downsample_ratio}_dt{self.preprocessor.accumulation_interval_ms}ms.pt"
+        cache_name = f"timesurface_tau{self.tau}_ds{self.events_downsample_ratio}.pt"
         cached_path = os.path.join(cache_dir_path, cache_name)
 
         if self.use_cache and os.path.exists(cached_path):
-            data = torch.load(cached_path)
+            return_dict = torch.load(cached_path)
             # print(f"Loaded cached Time Surface from: {cached_path}")
-            return data, torch.tensor(label, dtype=torch.long)
+            return return_dict
 
-        ts_all = []  # list of (C, H, W)
-
-        counter = 0
-            # Evaluate surface at last timestamp in this chunk
         if not self.use_polarity:
             ts, _ = create_time_surface(
                 source_H=self.height,
@@ -284,31 +278,31 @@ class TimeSurface(data.Dataset):
 
         ts = torch.from_numpy(ts_stack).float()
 
-        if self.use_cache:
-            os.makedirs(cache_dir_path, exist_ok=True)
-            torch.save(ts, cached_path)
-            # print(f"Saved cached Time Surface to: {cached_path}")
-
         return_dict = {
             'data': ts,
             'label': label,
             'path': path
         }
 
-        return ts, torch.tensor(label, dtype=torch.long), path
+        if self.use_cache:
+            os.makedirs(cache_dir_path, exist_ok=True)
+            torch.save(return_dict, cached_path)
+            # print(f"Saved cached Time Surface to: {cached_path}")
+
+        return return_dict
 
 def main():
     import matplotlib.pyplot as plt
     import time
 
-    dataset_dir = '/fs/nexus-projects/DVS_Actions/NatureRoboticsData/'
+    dataset_dir = '/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/N_Imagenet'
 
     dataset = TimeSurface(dataset_dir=dataset_dir,
                             width=680, height=680,
                             tau=0.5,
                             events_downsample_ratio=2,
                             use_cache=True,
-                            cache_root='/fs/nexus-projects/DVS_Actions/NatureRoboticsDataCache',
+                            cache_root='/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/cache',
                             use_polarity=True,
                             purpose='train')
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
@@ -316,9 +310,9 @@ def main():
 
     for _ in tqdm(range(len(dataloader)), desc="Batches"):
         start_time = time.perf_counter()
-        frames, cls_name = next(dataloader_iter)
+        return_dict = next(dataloader_iter)
         proc_time = time.perf_counter() - start_time
-        print(f"Class: {cls_name}, Frames: {frames.shape}")
+        print(f"Class: {return_dict['label']}, Frames: {return_dict['data'].shape}")
         print(f"Process time: {proc_time:.4f} s")
 
 if __name__ == '__main__':

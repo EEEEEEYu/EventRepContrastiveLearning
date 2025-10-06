@@ -7,9 +7,9 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from data.repr_utils.event_voxel import EventVoxel
-from data.repr_utils.hats import Hats
-from data.repr_utils.hots import HOTS
+# from data.repr_utils.event_voxel import EventVoxel
+# from data.repr_utils.hats import Hats
+# from data.repr_utils.hots import HOTS
 from data.repr_utils.time_surface import TimeSurface
 
 class Representation(Dataset):
@@ -64,17 +64,20 @@ class Representation(Dataset):
     
 
 if __name__ == "__main__":
-    dataset_dir = ''
-    dataset = Representation(representation_type='TimeSurface',
+    dataset_dir = '/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/N_Imagenet'
+    dataset = Representation(representation_type='time_surface',
                             dataset_dir=dataset_dir,
                             width=680, height=680,
                             tau=0.5,
                             events_downsample_ratio=2,
                             use_cache=True,
-                            cache_root='/fs/nexus-projects/DVS_Actions/NatureRoboticsDataCache',
+                            cache_root='/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/cache',
                             use_polarity=True,
                             purpose='train')
     print(f"Dataset size: {len(dataset)}")
+    print("Data shape:", dataset[0]['data'].shape)
+    print("Label:", dataset[0]['label'])
+    print("Path:", dataset[0]['path'])
 
 
 
