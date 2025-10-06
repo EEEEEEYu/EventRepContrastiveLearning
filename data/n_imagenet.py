@@ -90,7 +90,16 @@ class NImageNet(Dataset):
         events_t, events_xy, events_p = self.load_npz_into_events(npz_path)
         class_id = os.path.basename(os.path.dirname(npz_path))
         label = self.class_id_dict[class_id]
-        return events_t, events_xy, events_p, label
+
+        return_dict = {
+            'events_t': events_t,
+            'events_xy': events_xy,
+            'events_p': events_p,
+            'label': label,
+            'path': npz_path
+        }
+
+        return return_dict
 
 
 if __name__ == "__main__":
