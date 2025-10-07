@@ -212,8 +212,7 @@ class TimeSurface(data.Dataset):
         events_t, events_xy, events_p, label, path = item_dict['events_t'], item_dict['events_xy'], item_dict['events_p'], item_dict['label'], item_dict['path']
 
         # Build cache path
-        seq_folder = item_dict['path']
-        rel_seq_path = os.path.relpath(seq_folder, start=self.dataset_dir)
+        rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'time_surface')
         cache_name = f"timesurface_tau{self.tau}_ds{self.events_downsample_ratio}.pt"
         cached_path = os.path.join(cache_dir_path, cache_name)
