@@ -6,9 +6,9 @@ from tqdm import tqdm
 from copy import deepcopy
 import os
 
-from hots_utils.spatio_temporal_feature import TimeSurface, Event
-from hots_utils.utils import cosine_dist, euclidean_dist
-from hots_utils.noise_filter import remove_isolated_pixels
+from data.repr_utils.hots_utils.spatio_temporal_feature import TimeSurface, Event
+from data.repr_utils.hots_utils.utils import cosine_dist, euclidean_dist
+from data.repr_utils.hots_utils.noise_filter import remove_isolated_pixels
 
 # from event_Python import eventvision
 

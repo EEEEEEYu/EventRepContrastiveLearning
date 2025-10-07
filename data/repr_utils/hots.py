@@ -12,24 +12,14 @@ import cv2
 _HAS_CV2 = True
 
 # --- HOTS repo functions (use exactly these names) ---
-from hots_utils.noise_filter import remove_isolated_pixels
-from hots_utils.layer_operations import (
+from data.repr_utils.hots_utils.noise_filter import remove_isolated_pixels
+from data.repr_utils.hots_utils.layer_operations import (
     initialise_time_surface_prototypes,
     train_layer,
     generate_layer_outputs,
 )
 
-from data.utils.preprocessor import Preprocessor
-
-CLASS_NAME_TO_INT = {
-    "no_action": 0, "bottle": 1, "champagne": 2, "espresso": 3, "fork": 4, "hammer": 5,
-    "knife_bread": 6, "knife_cleaver": 7, "knife_coreing": 8, "knife_paring": 9,
-    "knife_steak": 10, "ladle": 11, "masher": 12, "mug": 13, "pliers": 14,
-    "screwdriver": 15, "shot": 16, "spatula": 17, "spoon": 18, "whisk": 19,
-    "wine": 20, "wrench": 21,
-}
-INT_TO_CLASS_NAME = {v: k for k, v in CLASS_NAME_TO_INT.items()}
-
+from data.n_imagenet import NImageNet as Preprocessor
 
 def normalize_array(arr: np.ndarray, normalize: str):
     arr = arr.astype(np.float32)
@@ -176,7 +166,7 @@ class HOTS(data.Dataset):
     ):
         # --- mirror your TimeSurface init ---
         self.dataset_dir = dataset_dir
-        self.preprocessor = Preprocessor(dataset_dir=dataset_dir, height=height, width=width)
+        self.preprocessor = Preprocessor(dataset_dir=dataset_dir, split=purpose)
         self.height = height
         self.width = width
         self.use_polarity = use_polarity  # if False, all events treated as a single polarity (p=1)
@@ -220,107 +210,101 @@ class HOTS(data.Dataset):
         return len(self.preprocessor)
 
     def __getitem__(self, idx):
-        item = self.preprocessor[idx]
-        events_t_list = item['events_t_sliced']
-        events_xy_list = item['events_xy_sliced']
-        events_p_list = item['events_p_sliced']
-        class_name = item['class_name']
+        item_dict = self.preprocessor[idx]
+        events_t, events_xy, events_p, label, path = item_dict['events_t'], item_dict['events_xy'], item_dict['events_p'], item_dict['label'], item_dict['path']
 
         # cache path per sequence (mirror your TimeSurface layout)
-        seq_folder = item['sequence_folder']
-        rel_seq_path = os.path.relpath(seq_folder, start=self.dataset_dir)
+        rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'hots')
         cache_name = (
             f"hots_N1{self.N_1}_KN{self.K_N}_Ktau{self.K_tau}_Kr{self.K_r}"
-            f"_eps{self.eps}_ms{self.min_samples}"
-            f"_dt{self.preprocessor.accumulation_interval_ms}ms.pt"
+            f"_eps{self.eps}_ms{self.min_samples}.pt"
         )
         cached_path = os.path.join(cache_dir_path, cache_name)
 
         if self.use_cache and os.path.exists(cached_path):
-            feats = torch.load(cached_path)
-            print(f"Loaded HOTS features from {cached_path}")
-            return feats, torch.tensor(CLASS_NAME_TO_INT[class_name], dtype=torch.long)
+            return_dict = torch.load(cached_path)
+            # print(f"Loaded HOTS features from {cached_path}")
+            return return_dict
 
         # Encode each temporal slice to a single histogram over layer-3 prototypes
-        slice_feats = []
-        for sidx, (t, xy, p) in enumerate(tqdm(
-                zip(events_t_list, events_xy_list, events_p_list),
-                total=len(events_t_list), desc="HOTS")):
 
-            if not self.use_polarity:
-                p = np.ones_like(p, dtype=np.int64)
+        if not self.use_polarity:
+            p = np.ones_like(p, dtype=np.int64)
 
-            ev = _arrays_to_event_list(t - t[0], xy, p)
+        ev = _arrays_to_event_list(events_t - events_t[0], events_xy, events_p)
 
-            if self.denoise:
-                ev_filt = remove_isolated_pixels(ev, eps=self.eps, min_samples=self.min_samples)[0]
-            else:
-                ev_filt = ev
+        if self.denoise:
+            ev_filt = remove_isolated_pixels(ev, eps=self.eps, min_samples=self.min_samples)[0]
+        else:
+            ev_filt = ev
 
-            # L1 -> L2 -> L3
-            ev_l2 = generate_layer_outputs(
-                num_polarities=2, features=self.C_1, tau=self.tau_1, r=self.r_1,
-                width=self.width, height=self.height, events=ev_filt
-            )
-            ev_l3 = generate_layer_outputs(
-                num_polarities=self.N_1, features=self.C_2, tau=self.tau_2, r=self.r_2,
-                width=self.width, height=self.height, events=ev_l2
-            )
-            ev_out = generate_layer_outputs(
-                num_polarities=self.N_2, features=self.C_3, tau=self.tau_3, r=self.r_3,
-                width=self.width, height=self.height, events=ev_l3
-            )
+        # L1 -> L2 -> L3
+        ev_l2 = generate_layer_outputs(
+            num_polarities=2, features=self.C_1, tau=self.tau_1, r=self.r_1,
+            width=self.width, height=self.height, events=ev_filt
+        )
+        ev_l3 = generate_layer_outputs(
+            num_polarities=self.N_1, features=self.C_2, tau=self.tau_2, r=self.r_2,
+            width=self.width, height=self.height, events=ev_l2
+        )
+        ev_out = generate_layer_outputs(
+            num_polarities=self.N_2, features=self.C_3, tau=self.tau_3, r=self.r_3,
+            width=self.width, height=self.height, events=ev_l3
+        )
 
-            # ----- DEBUG SAVE (raw L3 + visualization) -----
-            if self.debug_save_l3 and (self.debug_max_slices is None or sidx < self.debug_max_slices):
-                # where to save
-                seq_folder = item['sequence_folder']
-                rel_seq_path = os.path.relpath(seq_folder, start=self.dataset_dir)
-                base_dir = (self.debug_root if self.debug_root 
-                            else os.path.join(self.cache_root, rel_seq_path, 'hots_debug'))
-                pathlib.Path(base_dir).mkdir(parents=True, exist_ok=True)
+        # # ----- DEBUG SAVE (raw L3 + visualization) -----
+        # if self.debug_save_l3 and (self.debug_max_slices is None or sidx < self.debug_max_slices):
+        #     # where to save
+        #     rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
+        #     base_dir = (self.debug_root if self.debug_root 
+        #                 else os.path.join(self.cache_root, rel_seq_path, 'hots_debug'))
+        #     pathlib.Path(base_dir).mkdir(parents=True, exist_ok=True)
 
-                # raw arrays
-                tt, xxyy, pp = _events_to_arrays(ev_out)
-                npz_path = os.path.join(base_dir, f"l3_events_slice{sidx:04d}.npz")
-                np.savez_compressed(npz_path, t=tt, xy=xxyy, p=pp)
+        #     # raw arrays
+        #     tt, xxyy, pp = _events_to_arrays(ev_out)
+        #     npz_path = os.path.join(base_dir, f"l3_events_slice{sidx:04d}.npz")
+        #     np.savez_compressed(npz_path, t=tt, xy=xxyy, p=pp)
 
-                # label-map visualization
-                lab_l1 = _l3_events_to_labelmap(ev_l2, self.height, self.width, self.N_1, mode=self.debug_mode)
-                lab_l2 = _l3_events_to_labelmap(ev_l3, self.height, self.width, self.N_2, mode=self.debug_mode)
-                lab_l3 = _l3_events_to_labelmap(ev_out, self.height, self.width, self.N_3, mode=self.debug_mode)
-                png_path_l1 = os.path.join(base_dir, f"l1_labelmap_slice{sidx:04d}.png")
-                png_path_l2 = os.path.join(base_dir, f"l2_labelmap_slice{sidx:04d}.png")
-                png_path_l3 = os.path.join(base_dir, f"l3_labelmap_slice{sidx:04d}.png")
-                _save_labelmap_png(lab_l1, png_path_l1, self.N_1)
-                _save_labelmap_png(lab_l2, png_path_l2, self.N_2)
-                _save_labelmap_png(lab_l3, png_path_l3, self.N_3)
+        #     # label-map visualization
+        #     lab_l1 = _l3_events_to_labelmap(ev_l2, self.height, self.width, self.N_1, mode=self.debug_mode)
+        #     lab_l2 = _l3_events_to_labelmap(ev_l3, self.height, self.width, self.N_2, mode=self.debug_mode)
+        #     lab_l3 = _l3_events_to_labelmap(ev_out, self.height, self.width, self.N_3, mode=self.debug_mode)
+        #     png_path_l1 = os.path.join(base_dir, f"l1_labelmap_slice{sidx:04d}.png")
+        #     png_path_l2 = os.path.join(base_dir, f"l2_labelmap_slice{sidx:04d}.png")
+        #     png_path_l3 = os.path.join(base_dir, f"l3_labelmap_slice{sidx:04d}.png")
+        #     _save_labelmap_png(lab_l1, png_path_l1, self.N_1)
+        #     _save_labelmap_png(lab_l2, png_path_l2, self.N_2)
+        #     _save_labelmap_png(lab_l3, png_path_l3, self.N_3)
 
-                print(np.unique(pp, return_counts=True))
+        #     print(np.unique(pp, return_counts=True))
 
-            n0 = len(ev)                    # raw
-            n1 = len(ev_filt)               # after noise filter
-            n2 = len(ev_l2)
-            n3 = len(ev_l3)
-            n4 = len(ev_out)
-            if n4 == 0:
-                print(f"[slice {sidx}] empty: raw={n0}, filt={n1}, L2={n2}, L3={n3}, Lout={n4}")
+        # n0 = len(ev)                    # raw
+        # n1 = len(ev_filt)               # after noise filter
+        # n2 = len(ev_l2)
+        # n3 = len(ev_l3)
+        # n4 = len(ev_out)
+        # if n4 == 0:
+        #     print(f"[slice {sidx}] empty: raw={n0}, filt={n1}, L2={n2}, L3={n3}, Lout={n4}")
 
-            # ----- Histogram feature (your original) -----
-            h = _histogram_over_prototypes(ev_out, n_bins=self.N_3)
-            h = normalize_array(h, self.normalize)
-            slice_feats.append(h)
+        # ----- Histogram feature (your original) -----
+        h = _histogram_over_prototypes(ev_out, n_bins=self.N_3)
+        h = normalize_array(h, self.normalize)
 
-        feats_np = np.stack(slice_feats, axis=0)  # (L, D)
-        feats = torch.from_numpy(feats_np).float()
+        feats = torch.from_numpy(h).float()
+
+        return_dict = {
+            'data': feats,
+            'label': label,
+            'path': path
+        }
 
         if self.use_cache:
             os.makedirs(cache_dir_path, exist_ok=True)
-            torch.save(feats, cached_path)
-            print(f"Saved HOTS features to {cached_path}")
+            torch.save(return_dict, cached_path)
+            # print(f"Saved HOTS features to {cached_path}")
 
-        return feats, torch.tensor(CLASS_NAME_TO_INT[class_name], dtype=torch.long)
+        return return_dict
 
     # ---- same padded collate contract as your TimeSurface class ----
     @staticmethod
@@ -348,30 +332,30 @@ class HOTS(data.Dataset):
             if used >= self.max_slices_for_proto:
                 break
             item = self.preprocessor[i]
-            for t, xy, p in zip(item['events_t_sliced'], item['events_xy_sliced'], item['events_p_sliced']):
-                print(f"Collecting slice {used} for prototype training...")
-                if used >= self.max_slices_for_proto:
-                    break
-                if not self.use_polarity:
-                    p = np.ones_like(p, dtype=np.int64)
 
-                ev = _arrays_to_event_list(t - t[0], xy, p)
+            print(f"Collecting slice {used} for prototype training...")
+            if used >= self.max_slices_for_proto:
+                break
+            if not self.use_polarity:
+                p = np.ones_like(p, dtype=np.int64)
 
-                # shift timestamps to keep monotonicity across concatenation (same idea as repo)
-                if ev_all_filt:
-                    for e in ev:
-                        e.ts += ts_offset
-                if len(ev):
-                    ts_offset = max(ts_offset, ev[-1].ts)
+            ev = _arrays_to_event_list(item['events_t'] - item['events_t'][0], item['events_xy'], item['events_p'])
 
-                if self.denoise:
-                    ev_filt = remove_isolated_pixels(ev, eps=self.eps, min_samples=self.min_samples)[0]
-                    print(f"  raw events: {len(ev)}, filtered: {len(ev_filt)}")
-                else:
-                    ev_filt = ev
-                
-                ev_all_filt.extend(ev_filt)
-                used += 1
+            # shift timestamps to keep monotonicity across concatenation (same idea as repo)
+            if ev_all_filt:
+                for e in ev:
+                    e.ts += ts_offset
+            if len(ev):
+                ts_offset = max(ts_offset, ev[-1].ts)
+
+            if self.denoise:
+                ev_filt = remove_isolated_pixels(ev, eps=self.eps, min_samples=self.min_samples)[0]
+                print(f"  raw events: {len(ev)}, filtered: {len(ev_filt)}")
+            else:
+                ev_filt = ev
+            
+            ev_all_filt.extend(ev_filt)
+            used += 1
 
         if not ev_all_filt:
             raise RuntimeError("No events found to train prototypes. Check Preprocessor outputs.")
@@ -438,12 +422,6 @@ def main():
         K_N=2, K_tau=2.0, K_r=4,
         prototype_cache_root="./cache/hots_prototypes",
         max_slices_for_proto=2,
-        # NEW:
-        debug_save_l3=True,
-        debug_root="./cache/hots_debug",
-        debug_mode="vote",           # or "last"
-        debug_max_slices=100,         # only first 12 slices per sequence
-        denoise=False,
     )
 
     dl = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)  # batch_size=1 -> no padding needed

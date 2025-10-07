@@ -4,9 +4,16 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 from data.repr_utils.event_voxel import EventVoxel
-# from data.repr_utils.hats import Hats
+from data.repr_utils.hats import HATS
 from data.repr_utils.hots import HOTS
 from data.repr_utils.time_surface import TimeSurface
+
+REPRESENTATION_CLASSES = {
+    "event_voxel": EventVoxel,
+    "time_surface": TimeSurface,
+    "hots": HOTS,
+    "hats": HATS,
+}
 
 class Representation(Dataset):
     def __init__(self,
@@ -19,42 +26,24 @@ class Representation(Dataset):
                  cache_root: Optional[str] = None,
                  use_cache: bool = True,
                  **kwargs):
-        assert representation_type.lower() in ['event_voxel', 'time_surface', 'hots', 'hats'], \
+        assert representation_type.lower() in REPRESENTATION_CLASSES.keys(), \
             f"Unsupported representation type: {representation_type}"
         assert purpose.lower() in ['train', 'val', 'test'], \
             f"Unsupported purpose: {purpose}"
         
         self.representation_type = representation_type.lower()
+        self.representation_class = REPRESENTATION_CLASSES[self.representation_type]
 
-        if self.representation_type == 'event_voxel':
-            self.representation = EventVoxel(dataset_dir,
-                                       purpose=purpose,
-                                       height=height,
-                                       width=width,
-                                       use_polarity=use_polarity,
-                                       use_cache=use_cache,
-                                       cache_root=cache_root,
-                                       **kwargs)
-        elif self.representation_type == 'time_surface':
-            self.representation = TimeSurface(dataset_dir,
-                                                purpose=purpose,
-                                                height=height,
-                                                width=width,
-                                                use_polarity=use_polarity,
-                                                use_cache=use_cache,
-                                                cache_root=cache_root,
-                                                **kwargs)
-        elif self.representation_type == 'hots':
-            self.representation = HOTS(dataset_dir,
-                                       purpose=purpose,
-                                       height=height,
-                                       width=width,
-                                       use_polarity=use_polarity,
-                                       use_cache=use_cache,
-                                       cache_root=cache_root,
-                                       **kwargs)
-        elif self.representation_type == 'hats':
-            self.representation = Hats(dataset_dir, purpose)
+        self.representation = self.representation_class(
+            dataset_dir=dataset_dir,
+            height=height,
+            width=width,
+            use_polarity=use_polarity,
+            purpose=purpose,
+            use_cache=use_cache,
+            cache_root=cache_root,
+            **kwargs
+        )
         
         
 
@@ -104,21 +93,37 @@ if __name__ == "__main__":
     # print("Label:", dataset_hots[0]['label'])
     # print("Path:", dataset_hots[0]['path']) 
 
-    dataset_ev = Representation(representation_type='event_voxel',
+    # dataset_ev = Representation(representation_type='event_voxel',
+    #                             dataset_dir=dataset_dir,
+    #                             width=680, height=680,
+    #                             num_bins=9,
+    #                             accumulation_interval_ms=50.0,
+    #                             events_downsample_ratio=2,
+    #                             use_cache=True,
+    #                             cache_root='/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/cache',
+    #                             use_polarity=True,
+    #                             purpose='train',
+    #                         )
+    # print(f"Dataset size: {len(dataset_ev)}")
+    # print("Data shape:", dataset_ev[0]['data'].shape)
+    # print("Label:", dataset_ev[0]['label'])
+    # print("Path:", dataset_ev[0]['path'])
+
+    dataset_hats = Representation(representation_type='hats',
                                 dataset_dir=dataset_dir,
                                 width=680, height=680,
-                                num_bins=9,
-                                accumulation_interval_ms=50.0,
-                                events_downsample_ratio=2,
-                                use_cache=True,
+                                tau=0.5,
+                                R=170,
+                                K=170,
                                 cache_root='/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/cache',
+                                use_cache=True,
                                 use_polarity=True,
                                 purpose='train',
-                            )
-    print(f"Dataset size: {len(dataset_ev)}")
-    print("Data shape:", dataset_ev[0]['data'].shape)
-    print("Label:", dataset_ev[0]['label'])
-    print("Path:", dataset_ev[0]['path'])
+                                )
+    print(f"Dataset size: {len(dataset_hats)}")
+    print("Data shape:", dataset_hats[0]['data'].shape)
+    print("Label:", dataset_hats[0]['label'])
+    print("Path:", dataset_hats[0]['path'])
 
 
 
