@@ -25,10 +25,10 @@ def normalize_array(voxel_grid, normalize):
     
     return voxel_grid
 
-def create_voxel_grid_with_index(source_H, source_W, target_H, target_W, num_bins, events, output_index=False, normalize='standardization'):
+def create_voxel_grid_with_index(source_H, source_W, target_H, target_W, event_voxel_num_bins, events, output_index=False, normalize='standardization'):
     """
     Voxelize a chunk of events (t, x, y, p) into a 3D grid of shape:
-      (num_bins, target_H, target_W)
+      (event_voxel_num_bins, target_H, target_W)
     by counting events per time bin, and also return a corresponding nested list
     that holds the original event indices for each voxel.
     
@@ -44,15 +44,15 @@ def create_voxel_grid_with_index(source_H, source_W, target_H, target_W, num_bin
     Parameters:
       target_H       : int, desired output height (can be less than sensor height)
       target_W       : int, desired output width  (can be less than sensor width)
-      num_bins: int, number of temporal bins
+      event_voxel_num_bins: int, number of temporal bins
       events  : tuple with:
                   events[0]: 1D array of timestamps (assumed sorted),
                   events[1]: 2D array of (x, y) coordinates,
                   events[2]: 1D array of polarities (ignored here)
     
     Returns:
-      voxel_grid   : np.ndarray of shape (num_bins, target_H, target_W) with event counts.
-      voxel_indices: nested list [num_bins][target_H][target_W], where each element is a list
+      voxel_grid   : np.ndarray of shape (event_voxel_num_bins, target_H, target_W) with event counts.
+      voxel_indices: nested list [event_voxel_num_bins][target_H][target_W], where each element is a list
                       of event indices (from the original array) that fell into that voxel.
     """
     # Unpack events
@@ -78,20 +78,20 @@ def create_voxel_grid_with_index(source_H, source_W, target_H, target_W, num_bin
         # If all events have the same timestamp, assign bin 0.
         bin_idx = np.zeros_like(t, dtype=np.int64)
     else:
-        time_edges = np.linspace(t_min, t_max, num_bins + 1)
-        # np.digitize returns indices in 1...num_bins+1, so subtract 1.
+        time_edges = np.linspace(t_min, t_max, event_voxel_num_bins + 1)
+        # np.digitize returns indices in 1...event_voxel_num_bins+1, so subtract 1.
         bin_idx = np.digitize(t, time_edges, right=False) - 1
         # Ensure that events with t == t_max are assigned to the last bin.
-        bin_idx = np.clip(bin_idx, 0, num_bins - 1)
+        bin_idx = np.clip(bin_idx, 0, event_voxel_num_bins - 1)
 
     # Compute overall voxel index for each event:
     # overall_idx = bin_idx * (target_H*target_W) + (y_ds * target_W + x_ds)
     overall_idx = bin_idx * (target_H * target_W) + y_ds * target_W + x_ds
 
     # Use np.bincount to compute voxel counts over all voxels at once.
-    total_voxels = num_bins * target_H * target_W
+    total_voxels = event_voxel_num_bins * target_H * target_W
     counts = np.bincount(overall_idx, minlength=total_voxels)
-    voxel_grid = counts.reshape(num_bins, target_H, target_W).astype(np.float32)
+    voxel_grid = counts.reshape(event_voxel_num_bins, target_H, target_W).astype(np.float32)
 
     voxel_grid = normalize_array(voxel_grid, normalize)
 
@@ -106,8 +106,8 @@ def create_voxel_grid_with_index(source_H, source_W, target_H, target_W, num_bin
     unique_voxels, start_indices, group_counts = np.unique(
         sorted_voxels, return_index=True, return_counts=True)
 
-    # Prepare the nested list structure: [num_bins][target_H][target_W]
-    voxel_indices = [[[[] for _ in range(target_W)] for _ in range(target_H)] for _ in range(num_bins)]
+    # Prepare the nested list structure: [event_voxel_num_bins][target_H][target_W]
+    voxel_indices = [[[[] for _ in range(target_W)] for _ in range(target_H)] for _ in range(event_voxel_num_bins)]
     
     # For each unique voxel, determine its time bin and spatial location,
     # then assign the list of corresponding event indices.
@@ -129,13 +129,12 @@ class EventVoxel(data.Dataset):
             dataset_dir: str,
             height: int,
             width: int,
-            num_bins: int,
-            use_polarity: bool,
             use_cache: bool,
             cache_root: str,
             purpose: str,
-            events_downsample_ratio: float,
-            accumulation_interval_ms: float,
+            event_voxel_num_bins: int,
+            event_voxel_use_polarity: bool,
+            event_voxel_spatial_downsample_ratio: float,
         ):
         self.dataset_dir = dataset_dir
         self.preprocessor = Preprocessor(
@@ -144,13 +143,12 @@ class EventVoxel(data.Dataset):
         )
         self.height = height
         self.width = width
-        self.num_bins = num_bins
-        self.use_polarity = use_polarity
+        self.event_voxel_num_bins = event_voxel_num_bins
+        self.event_voxel_use_polarity = event_voxel_use_polarity
         self.use_cache = use_cache
         self.cache_root = cache_root
         self.purpose = purpose
-        self.events_downsample_ratio = events_downsample_ratio
-        self.accumulation_interval_ms = accumulation_interval_ms
+        self.event_voxel_spatial_downsample_ratio = event_voxel_spatial_downsample_ratio
 
     @staticmethod
     def collate_fn(batch):
@@ -171,20 +169,20 @@ class EventVoxel(data.Dataset):
         # Build cache path
         rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'event_voxel')
-        cached_path = os.path.join(cache_dir_path, f"voxel_{self.num_bins}_{self.accumulation_interval_ms}ms.pt")
+        cached_path = os.path.join(cache_dir_path, f"voxel_{self.event_voxel_num_bins}.pt")
 
         if self.use_cache and os.path.exists(cached_path):
             return_dict = torch.load(cached_path)
             # print(f"Loaded cached Event Voxel from: {cached_path}")
             return return_dict
 
-        if not self.use_polarity:
+        if not self.event_voxel_use_polarity:
             voxel_grid_np, _ = create_voxel_grid_with_index(
                 source_H=self.height,
                 source_W=self.width,
                 target_H=self.height,
                 target_W=self.width,
-                num_bins=self.num_bins,
+                event_voxel_num_bins=self.event_voxel_num_bins,
                 events=(events_t, events_xy),
                 output_index=False,
                 normalize='standardization'
@@ -196,9 +194,9 @@ class EventVoxel(data.Dataset):
             voxel_grid_pos, _ = create_voxel_grid_with_index(
                 source_H=self.height,
                 source_W=self.width,
-                target_H=int(self.height // self.events_downsample_ratio),
-                target_W=int(self.width // self.events_downsample_ratio),
-                num_bins=self.num_bins,
+                target_H=int(self.height // self.event_voxel_spatial_downsample_ratio),
+                target_W=int(self.width // self.event_voxel_spatial_downsample_ratio),
+                event_voxel_num_bins=self.event_voxel_num_bins,
                 events=(events_t[positive_idx], events_xy[positive_idx]),
                 output_index=False,
                 normalize='None' # Normalize only after concat
@@ -207,9 +205,9 @@ class EventVoxel(data.Dataset):
             voxel_grid_neg, _ = create_voxel_grid_with_index(
                 source_H=self.height,
                 source_W=self.width,
-                target_H=int(self.height // self.events_downsample_ratio),
-                target_W=int(self.width // self.events_downsample_ratio),
-                num_bins=self.num_bins,
+                target_H=int(self.height // self.event_voxel_spatial_downsample_ratio),
+                target_W=int(self.width // self.event_voxel_spatial_downsample_ratio),
+                event_voxel_num_bins=self.event_voxel_num_bins,
                 events=(events_t[negative_idx], events_xy[negative_idx]),
                 output_index=False,
                 normalize='None' # Normalize only after concat

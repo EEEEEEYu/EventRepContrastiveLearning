@@ -12,13 +12,13 @@ class HATS(Dataset):
     def __init__(self, dataset_dir,
                  width: int,
                  height: int,
-                 tau: float,
-                 R: int,
-                 K: int,
+                 HATS_tau: float,
+                 HATS_R: int,
+                 HATS_K: int,
                  cache_root: str,
                  purpose='train',
                  use_cache=True,
-                 normalize='None',
+                 HATS_normalize='None',
                  use_polarity=True):
         assert purpose in ['train', 'test'], "Split must be either 'train' or 'test'."
 
@@ -29,20 +29,20 @@ class HATS(Dataset):
         self.cache_root = cache_root
         self.width = width
         self.height = height
-        self.target_W = K
-        self.target_H = K
-        self.tau = tau
-        self.R = R
-        self.K = K
-        self.normalize = normalize
+        self.target_W = HATS_K
+        self.target_H = HATS_K
+        self.HATS_tau = HATS_tau
+        self.HATS_R = HATS_R
+        self.HATS_K = HATS_K
+        self.HATS_normalize = HATS_normalize
         
-        self.num_cell_width = (width // K)   # number of cells horizontally
-        self.num_cell_height = (height // K) # number of cells vertically
+        self.num_cell_width = (width // HATS_K)   # number of cells horizontally
+        self.num_cell_height = (height // HATS_K) # number of cells vertically
         self.n_cells = self.num_cell_width * self.num_cell_height
         self.n_polarities = 2
 
-        self.cell_per_pixel_last_timestamps = np.zeros((self.n_cells, self.n_polarities, 2*self.R+1, 2*self.R+1), dtype=np.float32)
-        self.cell_per_pixel_sum = np.zeros((self.n_cells, self.n_polarities, 2*self.R+1, 2*self.R+1), dtype=np.float32)
+        self.cell_per_pixel_last_timestamps = np.zeros((self.n_cells, self.n_polarities, 2*self.HATS_R+1, 2*self.HATS_R+1), dtype=np.float32)
+        self.cell_per_pixel_sum = np.zeros((self.n_cells, self.n_polarities, 2*self.HATS_R+1, 2*self.HATS_R+1), dtype=np.float32)
         self.event_count = np.zeros((self.n_cells, self.n_polarities), dtype=np.int32)
 
     @staticmethod
@@ -62,7 +62,7 @@ class HATS(Dataset):
         # Build cache path
         rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'HATS')
-        cache_name = f"HAT_tau={self.tau}_R={self.R}_K={self.K}.pt"
+        cache_name = f"HAT_HATS_tau={self.HATS_tau}_R={self.HATS_R}_K={self.HATS_K}.pt"
         cached_path = os.path.join(cache_dir_path, cache_name)
 
         if self.use_cache and os.path.exists(cached_path):
@@ -99,7 +99,7 @@ class HATS(Dataset):
         hats_poss = np.stack(hats_poss, axis=0)  # (n_cells, H, W)
         hats_negs = np.stack(hats_negs, axis=0)  # (n_cells, H, W)
         hats = np.stack([hats_poss, hats_negs], axis=1)  # (n_cells, 2, H, W)
-        hats = normalize_array(hats, self.normalize)
+        hats = normalize_array(hats, self.HATS_normalize)
 
         # output = np.stack(output, axis=0)  # (n_cells, 2, H, W)
         # C, P, H, W = output.shape
@@ -145,10 +145,10 @@ class HATS(Dataset):
             target_H=self.target_H,
             target_W=self.target_W,
             events=(events_t[pos_idx], events_xy[pos_idx]),
-            tau=self.tau,
+            HATS_tau=self.HATS_tau,
             t_query=None,
             output_index=False,
-            normalize='None',  # normalize after stacking if desired
+            HATS_normalize='None',  # HATS_normalize after stacking if desired
         )
         hats_neg, _ = create_hats(
             source_H=self.height,
@@ -156,17 +156,17 @@ class HATS(Dataset):
             target_H=self.target_H,
             target_W=self.target_W,
             events=(events_t[neg_idx], events_xy[neg_idx]),
-            tau=self.tau,
+            HATS_tau=self.HATS_tau,
             t_query=None,
             output_index=False,
-            normalize='None',
+            HATS_normalize='None',
         )
 
-        hats_pos = normalize_array(hats_pos, self.normalize)
-        hats_neg = normalize_array(hats_neg, self.normalize)
+        hats_pos = normalize_array(hats_pos, self.HATS_normalize)
+        hats_neg = normalize_array(hats_neg, self.HATS_normalize)
 
         # hats_stack = np.stack([hats_pos, hats_neg], axis=0)  # (2, H, W)
-        # hats_stack = normalize_array(hats_stack, self.normalize)
+        # hats_stack = normalize_array(hats_stack, self.HATS_normalize)
 
         return hats_pos, hats_neg
     
@@ -174,7 +174,7 @@ import numpy as np
 from numba import njit
 
 @njit(parallel=True, cache=True, fastmath=True)
-def split_events_KxK_numba(t, xy, p, H, W, K):
+def split_events_KxK_numba(t, xy, p, H, W, HATS_K):
     """
     Split events into KxK grid cells. Output arrays are grouped contiguously
     by cell (row-major), and xy_out contains *cell-local* coordinates where
@@ -184,14 +184,14 @@ def split_events_KxK_numba(t, xy, p, H, W, K):
         t_out  : (N,)
         xy_out : (N, 2)  with local (x, y) per cell
         p_out  : (N,)
-        offsets: (K*K + 1,) prefix-sum; events for cell c are in [offsets[c], offsets[c+1])
+        offsets: (HATS_K*HATS_K + 1,) prefix-sum; events for cell c are in [offsets[c], offsets[c+1])
     """
     N = t.shape[0]
-    counts = np.zeros(K * K, np.int64)
+    counts = np.zeros(HATS_K * HATS_K, np.int64)
 
     # cell sizes using ceil division so we cover the whole image
-    cell_w = (W + K - 1) // K
-    cell_h = (H + K - 1) // K
+    cell_w = (W + HATS_K - 1) // HATS_K
+    cell_h = (H + HATS_K - 1) // HATS_K
 
     # ---- pass 1: histogram counts per cell ----
     for i in range(N):
@@ -199,15 +199,15 @@ def split_events_KxK_numba(t, xy, p, H, W, K):
         y = xy[i, 1]
         cx = x // cell_w
         cy = y // cell_h
-        if cx >= K: cx = K - 1
-        if cy >= K: cy = K - 1
-        cid = cy * K + cx
+        if cx >= HATS_K: cx = HATS_K - 1
+        if cy >= HATS_K: cy = HATS_K - 1
+        cid = cy * HATS_K + cx
         counts[cid] += 1
 
     # ---- prefix sums => offsets ----
-    offsets = np.empty(K * K + 1, np.int64)
+    offsets = np.empty(HATS_K * HATS_K + 1, np.int64)
     offsets[0] = 0
-    for k in range(K * K):
+    for k in range(HATS_K * HATS_K):
         offsets[k + 1] = offsets[k] + counts[k]
 
     # ---- pass 2: scatter with cell-local coordinates ----
@@ -223,9 +223,9 @@ def split_events_KxK_numba(t, xy, p, H, W, K):
         # which cell?
         cx = x // cell_w
         cy = y // cell_h
-        if cx >= K: cx = K - 1
-        if cy >= K: cy = K - 1
-        cid = cy * K + cx
+        if cx >= HATS_K: cx = HATS_K - 1
+        if cy >= HATS_K: cy = HATS_K - 1
+        cid = cy * HATS_K + cx
 
         # cell top-left in global coords
         cell_x0 = cx * cell_w
@@ -262,10 +262,10 @@ def create_hats(source_H: int,
                 target_H: int,
                 target_W: int,
                 events: tuple[np.ndarray, np.ndarray],
-                tau: float,
+                HATS_tau: float,
                 t_query: float | None = None,
                 output_index: bool = False,
-                normalize: str = 'None',
+                HATS_normalize: str = 'None',
                 avg_radius: int = 1):
     """
     HATS for ONE cell/neighborhood (events already localized to this patch).
@@ -295,12 +295,12 @@ def create_hats(source_H: int,
         target_H, target_W, x, y, t.astype(np.float64)
     )
 
-    # Time surface (delta in microseconds -> decay by tau)
-    delta = (t_query - last_time_flat) / 1.0e6 / float(tau)
+    # Time surface (delta in microseconds -> decay by HATS_tau)
+    delta = (t_query - last_time_flat) / 1.0e6 / float(HATS_tau)
     ts = np.exp(-delta).reshape(target_H, target_W).astype(np.float32)
 
     # Optional normalization (usually unnecessary for TS/HATS)
-    ts = normalize_array(ts, normalize)
+    ts = normalize_array(ts, HATS_normalize)
 
     if output_index:
         return ts, last_idx_flat.reshape(target_H, target_W)
@@ -357,29 +357,29 @@ def _last_event_time_per_pixel(target_H: int,
     return last_time_map_flat, last_idx_map_flat
 
 
-def normalize_array(arr: np.ndarray, normalize: str):
+def normalize_array(arr: np.ndarray, HATS_normalize: str):
     """
     Normalize a numpy array in-place.
     Args:
         arr: np.ndarray
-        normalize: 'standardization' | 'normalization' | 'None'
+        HATS_normalize: 'standardization' | 'normalization' | 'None'
     Returns:
         np.ndarray
     """
     arr = arr.astype(np.float32)
     eps = 1e-8
-    if normalize == 'standardization':
+    if HATS_normalize == 'standardization':
         mean = arr.mean()
         std = arr.std()
         arr = (arr - mean) / (std + eps)
-    elif normalize == 'normalization':
+    elif HATS_normalize == 'normalization':
         min_val = arr.min()
         max_val = arr.max()
         arr = (arr - min_val) / (max_val - min_val + eps)
-    elif normalize == 'None':
+    elif HATS_normalize == 'None':
         pass
     else:
-        raise ValueError(f"Unknown normalization method: {normalize}")
+        raise ValueError(f"Unknown normalization method: {HATS_normalize}")
     return arr
 
 
@@ -389,9 +389,9 @@ def main():
     dataset_dir = '/fs/nexus-projects/DVS_Actions/NatureRoboticsData/'
     dataset = HATS(dataset_dir,
                    width=680, height=680,
-                   tau=0.5,
-                   R=170,
-                   K=170,
+                   HATS_tau=0.5,
+                   HATS_R=170,
+                   HATS_K=170,
                    cache_root="/fs/nexus-projects/DVS_Actions/NatureRoboticsDataCache",
                    use_cache=True,
                    purpose="train")

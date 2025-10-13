@@ -19,7 +19,6 @@ import torch.optim.lr_scheduler as lrs
 import lightning.pytorch as pl
 
 from utils.metrics.classification import top1_accuracy, top5_accuracy
-from loss.contrastive_learning import cross_entropy_loss
 from typing import Callable, Dict, Tuple
 
 from loss.contrastive_learning import global_multipos_info_nce, dense_info_nce
@@ -90,7 +89,7 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
         if self.model_class_name == 'unimodal':
             # TODO: add specific transformations for each representation, if necessary
             val_input = batch
-            val_out = self(val_input)
+            val_out = self(val_input['repr_data'][0])
             val_recon_loss = self.loss_function(val_out, val_input)
             self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
             # TODO: add PSNR & LPIPS metrics
@@ -112,17 +111,17 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             loss_val = val_loss_dict['total_loss']
             self.log('val_CL_loss', loss_val.item(), on_step=True, on_epoch=True, prog_bar=True)
             self.log('val_global_CL_loss', val_loss_dict['global_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_dense_CL_loss', val_loss_dict['dense_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
+            # self.log('val_dense_CL_loss', val_loss_dict['dense_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
 
             # Metrics
             global_pos_sim_mean = val_loss_dict['global_pos_sim_mean']
             global_neg_sim_mean = val_loss_dict['global_neg_sim_mean']
-            dense_pos_sim_mean = val_loss_dict['dense_pos_sim_mean']
-            dense_neg_sim_mean = val_loss_dict['dense_neg_sim_mean']
+            # dense_pos_sim_mean = val_loss_dict['dense_pos_sim_mean']
+            # dense_neg_sim_mean = val_loss_dict['dense_neg_sim_mean']
             self.log('val_global_pos_sim_mean', global_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
             self.log('val_global_neg_sim_mean', global_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_dense_pos_sim_mean', dense_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_dense_neg_sim_mean', dense_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            # self.log('val_dense_pos_sim_mean', dense_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            # self.log('val_dense_neg_sim_mean', dense_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
 
             return {
                 'loss': loss_val
@@ -183,28 +182,28 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
                 temperature=self.global_multipos_info_nce_temperature, 
                 eps=self.global_multipos_info_nce_eps
             )
-            dense_CL_loss_dict = dense_info_nce(
+            """dense_CL_loss_dict = dense_info_nce(
                 maps=feature_maps, 
                 temperature=self.dense_info_nce_temperature, 
                 include_spatial_negatives=self.dense_info_nce_include_spatial_negatives, 
                 neighborhood=self.dense_info_nce_neighborhood, 
                 eps=self.dense_info_nce_eps
-            )
+            )"""
 
-            total_loss = self.global_CL_lambda * global_CL_loss_dict['loss'] + self.dense_CL_lambda * dense_CL_loss_dict['loss']
+            total_loss = self.global_CL_lambda * global_CL_loss_dict['loss'] # + self.dense_CL_lambda * dense_CL_loss_dict['loss']
 
             return {
                 'global_CL_loss': global_CL_loss_dict['loss'],
                 'global_pos_sim_mean': global_CL_loss_dict['pos_sim_mean'],
                 'global_neg_sim_mean': global_CL_loss_dict['neg_sim_mean'],
-                'dense_CL_loss': dense_CL_loss_dict['loss'],
+                """'dense_CL_loss': dense_CL_loss_dict['loss'],
                 'dense_pos_sim_mean': dense_CL_loss_dict['pos_sim_mean'],
-                'dense_neg_sim_mean': dense_CL_loss_dict['neg_sim_mean'],
+                'dense_neg_sim_mean': dense_CL_loss_dict['neg_sim_mean'],"""
                 'total_loss': total_loss
             }
 
 
-        if self.model_class_name == 'unimodal':
+        if self.hparams.model_class_name == 'unimodal':
             return unimodal_loss_func
         else:
             return contrastive_loss_func

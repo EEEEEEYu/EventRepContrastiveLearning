@@ -9,29 +9,29 @@ from data.n_imagenet import NImageNet as Preprocessor
 from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 
-def normalize_array(arr: np.ndarray, normalize: str):
+def normalize_array(arr: np.ndarray, time_surface_normalize: str):
     """
     Normalize a numpy array in-place.
     Args:
         arr: np.ndarray
-        normalize: 'standardization' | 'normalization' | 'None'
+        time_surface_normalize: 'standardization' | 'normalization' | 'None'
     Returns:
         np.ndarray
     """
     arr = arr.astype(np.float32)
     eps = 1e-8
-    if normalize == 'standardization':
+    if time_surface_normalize == 'standardization':
         mean = arr.mean()
         std = arr.std()
         arr = (arr - mean) / (std + eps)
-    elif normalize == 'normalization':
+    elif time_surface_normalize == 'normalization':
         min_val = arr.min()
         max_val = arr.max()
         arr = (arr - min_val) / (max_val - min_val + eps)
-    elif normalize == 'None':
+    elif time_surface_normalize == 'None':
         pass
     else:
-        raise ValueError(f"Unknown normalization method: {normalize}")
+        raise ValueError(f"Unknown normalization method: {time_surface_normalize}")
     return arr
 
 
@@ -90,15 +90,15 @@ def create_time_surface(source_H: int,
                         target_H: int,
                         target_W: int,
                         events: tuple[np.ndarray, np.ndarray],
-                        tau: float,
+                        time_surface_tau: float,
                         t_query: float | None = None,
                         output_index: bool = False,
-                        normalize: str = 'None'):
+                        time_surface_normalize: str = 'None'):
     """
     Compute a Time Surface (TS) for a chunk of events at query time t_query.
 
     Time Surface (per polarity or all events):
-        TS(x, y; t_query) = exp(- (t_query - T_last(x, y)) / tau)
+        TS(x, y; t_query) = exp(- (t_query - T_last(x, y)) / time_surface_tau)
     where T_last(x, y) is the timestamp of the most recent event at pixel (x, y)
     before (or at) t_query. Pixels with no prior events have value 0.
 
@@ -106,10 +106,10 @@ def create_time_surface(source_H: int,
         source_H, source_W: original sensor resolution.
         target_H, target_W: desired output resolution (<= source size); coordinates are downsampled by integer factors.
         events: (t, xy) where t is (N,), xy is (N, 2) with columns (x, y). Assumes ascending t.
-        tau: decay constant in the same time units as 't'.
+        time_surface_tau: decay constant in the same time units as 't'.
         t_query: time at which the surface is evaluated. If None, uses last timestamp in t.
         output_index: if True, also returns the last event index per pixel (int) with -1 for no event.
-        normalize: optional normalization on the final map ('None' recommended since TS is already in [0,1]).
+        time_surface_normalize: optional normalization on the final map ('None' recommended since TS is already in [0,1]).
 
     Returns:
         ts: np.ndarray of shape (target_H, target_W), dtype float32, in [0, 1].
@@ -144,12 +144,12 @@ def create_time_surface(source_H: int,
     )
 
     # Exponential decay; pixels with no events have last_time=-1e20 -> exp(-huge) ~ 0
-    delta = (t_query - last_time_flat) / 1.0e6 / float(tau)
+    delta = (t_query - last_time_flat) / 1.0e6 / float(time_surface_tau)
     # Numerical safety
     ts_flat = np.exp(-delta)
 
     ts = ts_flat.reshape(target_H, target_W).astype(np.float32)
-    ts = normalize_array(ts, normalize)
+    ts = normalize_array(ts, time_surface_normalize)
 
     if output_index:
         return ts, last_idx_flat.reshape(target_H, target_W)
@@ -162,7 +162,7 @@ class TimeSurface(data.Dataset):
 
     Output per sample: (L, C, H, W) where:
         L: number of temporal chunks produced by the Preprocessor
-        C: 1 if use_polarity=False, else 2 (pos, neg)
+        C: 1 if time_surface_use_polarity=False, else 2 (pos, neg)
         H, W: target (possibly downsampled) spatial resolution
     """
 
@@ -171,29 +171,29 @@ class TimeSurface(data.Dataset):
         dataset_dir: str,
         height: int,
         width: int,
-        use_polarity: bool,
         use_cache: bool,
         cache_root: str,
         purpose: str,
-        events_downsample_ratio: float,
-        tau: float,
-        normalize: str = 'None',
+        time_surface_use_polarity: bool,
+        time_surface_spatial_downsample_ratio: float,
+        time_surface_tau: float,
+        time_surface_normalize: str = 'None',
     ):
         self.dataset_dir = dataset_dir
         self.preprocessor = Preprocessor(dataset_dir=dataset_dir, split=purpose)
         self.height = height
         self.width = width
-        self.use_polarity = use_polarity
+        self.time_surface_use_polarity = time_surface_use_polarity
         self.use_cache = use_cache
         self.cache_root = cache_root
         self.purpose = purpose
-        self.events_downsample_ratio = events_downsample_ratio
-        self.tau = tau
-        self.normalize = normalize
+        self.time_surface_spatial_downsample_ratio = time_surface_spatial_downsample_ratio
+        self.time_surface_tau = time_surface_tau
+        self.time_surface_normalize = time_surface_normalize
 
         # Target size (integer downsample)
-        self.target_H = int(self.height // self.events_downsample_ratio)
-        self.target_W = int(self.width // self.events_downsample_ratio)
+        self.target_H = int(self.height // self.time_surface_spatial_downsample_ratio)
+        self.target_W = int(self.width // self.time_surface_spatial_downsample_ratio)
         self.target_H = max(1, self.target_H)
         self.target_W = max(1, self.target_W)
 
@@ -214,7 +214,7 @@ class TimeSurface(data.Dataset):
         # Build cache path
         rel_seq_path = os.path.relpath(path, start=self.dataset_dir)
         cache_dir_path = os.path.join(self.cache_root, rel_seq_path, 'time_surface')
-        cache_name = f"timesurface_tau{self.tau}_ds{self.events_downsample_ratio}.pt"
+        cache_name = f"timesurface_tau{self.time_surface_tau}_ds{self.time_surface_spatial_downsample_ratio}.pt"
         cached_path = os.path.join(cache_dir_path, cache_name)
 
         if self.use_cache and os.path.exists(cached_path):
@@ -222,17 +222,17 @@ class TimeSurface(data.Dataset):
             # print(f"Loaded cached Time Surface from: {cached_path}")
             return return_dict
 
-        if not self.use_polarity:
+        if not self.time_surface_use_polarity:
             ts, _ = create_time_surface(
                 source_H=self.height,
                 source_W=self.width,
                 target_H=self.target_H,
                 target_W=self.target_W,
                 events=(events_t, events_xy),
-                tau=self.tau,
+                time_surface_tau=self.time_surface_tau,
                 t_query=None,  # last timestamp
                 output_index=False,
-                normalize=self.normalize,
+                time_surface_normalize=self.time_surface_normalize,
             )
             ts_stack = ts[None, ...]  # (1, H, W)
         else:
@@ -245,10 +245,10 @@ class TimeSurface(data.Dataset):
                 target_H=self.target_H,
                 target_W=self.target_W,
                 events=(events_t[pos_idx], events_xy[pos_idx]),
-                tau=self.tau,
+                time_surface_tau=self.time_surface_tau,
                 t_query=None,
                 output_index=False,
-                normalize='None',  # normalize after stacking if desired
+                time_surface_normalize='None',  # time_surface_normalize after stacking if desired
             )
             ts_neg, _ = create_time_surface(
                 source_H=self.height,
@@ -256,14 +256,14 @@ class TimeSurface(data.Dataset):
                 target_H=self.target_H,
                 target_W=self.target_W,
                 events=(events_t[neg_idx], events_xy[neg_idx]),
-                tau=self.tau,
+                time_surface_tau=self.time_surface_tau,
                 t_query=None,
                 output_index=False,
-                normalize='None',
+                time_surface_normalize='None',
             )
 
-            ts_pos = normalize_array(ts_pos, self.normalize)
-            ts_neg = normalize_array(ts_neg, self.normalize)
+            ts_pos = normalize_array(ts_pos, self.time_surface_normalize)
+            ts_neg = normalize_array(ts_neg, self.time_surface_normalize)
 
             # # save ts_pos as an image
             # plt.imshow(ts_pos, cmap='hot')
@@ -273,7 +273,7 @@ class TimeSurface(data.Dataset):
             # counter += 1
 
             ts_stack = np.stack([ts_pos, ts_neg], axis=0)  # (2, H, W)
-            ts_stack = normalize_array(ts_stack, self.normalize)
+            ts_stack = normalize_array(ts_stack, self.time_surface_normalize)
 
         ts = torch.from_numpy(ts_stack).float()
 
@@ -298,11 +298,11 @@ def main():
 
     dataset = TimeSurface(dataset_dir=dataset_dir,
                             width=680, height=680,
-                            tau=0.5,
-                            events_downsample_ratio=2,
+                            time_surface_tau=0.5,
+                            time_surface_spatial_downsample_ratio=2,
                             use_cache=True,
                             cache_root='/fs/nexus-scratch/tuxunlu/git/EventRepContrastiveLearning/cache',
-                            use_polarity=True,
+                            time_surface_use_polarity=True,
                             purpose='train')
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     dataloader_iter = iter(dataloader)

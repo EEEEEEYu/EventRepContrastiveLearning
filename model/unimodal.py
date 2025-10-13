@@ -6,8 +6,9 @@ from model.convnext_utils.convnext_blocks import ConvNeXtAutoEncoder
 class Unimodal(nn.Module):
     def __init__(
             self,
-            repr_names,
-            in_size,
+            representation_names,
+            height,
+            width,
             in_channels,
             latent_size,
             latent_channels,
@@ -17,13 +18,13 @@ class Unimodal(nn.Module):
             drop_path_rate,
             use_grn,
         ):
-        super.__init__()
+        super().__init__()
 
-        self.repr_names = repr_names
+        self.representation_names = representation_names
 
         self.autoencoder = ConvNeXtAutoEncoder(
             in_channels=in_channels,
-            in_size=in_size,
+            in_size=(height, width),
             target_size=latent_size,
             latent_channels=latent_channels,
             out_channels=in_channels,

@@ -11,18 +11,26 @@ num_nodes: 1
 strategy: auto
 
 ##################### Dataset Setting #####################
-dataset_class_name: n_imagenet
-dataset_dir: dataset
-repr_names: ['event_voxel']
+dataset_class_name: representation
+dataset_dir: dataset/N-ImageNet
+representation_names: ['time_surface']
 split_ratios: [0.8, 0.1, 0.1]
-batch_size: 128
-test_batch_size: 32
+batch_size: 8
+test_batch_size: 8
 num_workers: 8
 persistent_workers: True
+use_cache: True
+cache_root: dataset/N-ImageNetCache
+purpose: train
+time_surface_use_polarity: True
+time_surface_tau: 0.5
+time_surface_normalize: 'standardization'
+time_surface_spatial_downsample_ratio: 1.0
 
 ##################### Model Architecture #####################
 model_class_name: unimodal
-in_size: [640, 480]
+height: 640
+width: 480
 in_channels: 10
 latent_size: [20, 15]
 latent_channels: 64
