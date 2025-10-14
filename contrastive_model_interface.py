@@ -18,11 +18,12 @@ import importlib
 import torch.optim.lr_scheduler as lrs
 import lightning.pytorch as pl
 
-from utils.metrics.classification import top1_accuracy, top5_accuracy
 from typing import Callable, Dict, Tuple
 
-from loss.contrastive_learning import global_multipos_info_nce, dense_info_nce
+from loss.contrastive_learning import global_multipos_info_nce
 from loss.reconstruction import recon_loss
+
+from utils.metrics.reconstruction import compute_psnr
 
 
 class ContrastiveLearningModelInterface(pl.LightningModule):
@@ -35,20 +36,12 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
         # Parse model type
         self.model_class_name = str(self.hparams.model_class_name)
         if self.model_class_name != 'unimodal':
-            self.global_CL_lambda = float(self.hparams.global_CL_lambda)
-            self.global_multipos_info_nce_temperature = float(self.hparams.global_multipos_info_nce_temperature)
-            self.global_multipos_info_nce_eps = float(self.hparams.global_multipos_info_nce_eps)
-            self.dense_CL_lambda = float(self.hparams.dense_CL_lambda)
-            self.dense_info_nce_temperature = float(self.dense_info_nce_temperature)
-            self.dense_info_nce_include_spatial_negatives = bool(self.hparams.dense_info_nce_include_spatial_negatives)
-            self.dense_info_nce_neighborhood = int(self.hparams.dense_info_nce_neighborhood)
-            self.dense_info_nce_eps = float(self.hparams.dense_info_nce_eps)
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.global_multipos_info_nce_temperature} type: {type(self.hparams.global_multipos_info_nce_temperature)} parsed: {self.hparams.global_multipos_info_nce_temperature}')
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.global_multipos_info_nce_eps} type: {type(self.hparams.global_multipos_info_nce_eps)} parsed: {self.hparams.global_multipos_info_nce_eps}')
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_temperature} type: {type(self.hparams.dense_info_nce_temperature)} parsed: {self.hparams.dense_info_nce_temperature}')
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_include_spatial_negatives} type: {type(self.hparams.dense_info_nce_include_spatial_negatives)} parsed: {self.hparams.dense_info_nce_include_spatial_negatives}')
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_neighborhood} type: {type(self.hparams.dense_info_nce_neighborhood)} parsed: {self.hparams.dense_info_nce_neighborhood}')
-            print(f'raw global_multipos_info_nce_temperature: {self.hparams.dense_info_nce_eps} type: {type(self.hparams.dense_info_nce_eps)} parsed: {self.hparams.dense_info_nce_eps}')
+            self.CL_lambda = float(self.hparams.CL_lambda)
+            self.info_nce_temperature = float(self.hparams.info_nce_temperature)
+            self.info_nce_eps = float(self.hparams.info_nce_eps)
+            print(f'raw info_nce_temperature: {self.hparams.info_nce_temperature} type: {type(self.hparams.info_nce_temperature)} parsed: {self.hparams.info_nce_temperature}')
+            print(f'raw info_nce_eps: {self.hparams.info_nce_eps} type: {type(self.hparams.info_nce_eps)} parsed: {self.hparams.info_nce_eps}')
+
 
     def forward(self, x):
         return self.model(x)
@@ -69,59 +62,61 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
 
     # Caution: self.model.train() is invoked
     def training_step(self, batch, batch_idx):
-        train_input, train_labels = batch
-        train_out = self(train_input)
-        train_loss_dict = self.loss_function(train_out, train_labels, 'val')
-        loss_train = train_loss_dict['loss']
+        if self.model_class_name == 'unimodal':
+            train_input = batch['repr_data'][0]
+            train_out = self(train_input)
+            train_recon_loss = self.loss_function(train_out['x_hat'], train_input)
+            train_psnr = compute_psnr(train_out['x_hat'], train_input)
+            self.log('train_recon_loss', train_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_psnr', train_psnr.item(), on_step=True, on_epoch=True, prog_bar=True)
 
-        # Metrics
-        pos_sim_mean = train_loss_dict['pos_sim_mean']
-        neg_sim_mean = train_loss_dict['neg_sim_mean']
-        self.log('train_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+        elif self.model_class_name == 'pairwise':
+            train_input = batch
+            train_out_dict = self(train_input)
+            repr1_embedding = train_out_dict['repr1_embedding']
+            repr2_embedding = train_out_dict['repr2_embedding']
+            stacked_embedding = torch.concat([repr1_embedding.unsqueeze(1), repr2_embedding.unsqueeze(1)], dim=1)
+            train_loss_dict = self.loss_function(stacked_embedding)
 
-        return {
-            'loss': loss_train
-        }
+            loss_train = train_loss_dict['total_loss']
+            self.log('train_CL_loss', loss_train.item(), on_step=True, on_epoch=True, prog_bar=True)
+
+            # Metrics
+            pos_sim_mean = train_loss_dict['pos_sim_mean']
+            neg_sim_mean = train_loss_dict['neg_sim_mean']
+            self.log('train_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+
+            return {
+                'loss': loss_train
+            }
 
     # Caution: self.model.eval() is invoked and this function executes within a <with torch.no_grad()> context
     def validation_step(self, batch, batch_idx):
         if self.model_class_name == 'unimodal':
-            # TODO: add specific transformations for each representation, if necessary
-            val_input = batch
-            val_out = self(val_input['repr_data'][0])
-            val_recon_loss = self.loss_function(val_out, val_input)
+            val_input = batch['repr_data'][0]
+            val_out = self(val_input)
+            val_recon_loss = self.loss_function(val_out['x_hat'], val_input)
+            val_psnr = compute_psnr(val_out['x_hat'], val_input)
             self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
-            # TODO: add PSNR & LPIPS metrics
-            # TODO: which embedding to use for the full autoencoder?
-            
+            self.log('val_psnr', val_psnr.item(), on_step=True, on_epoch=True, prog_bar=True)
             
         elif self.model_class_name == 'pairwise':
-            # TODO: add specific transformations for each representation, if necessary
-            val_input, val_labels = batch
+            val_input = batch
             val_out_dict = self(val_input)
-            repr1_feature_map = val_out_dict['repr1_feature_map']
-            repr2_feature_map = val_out_dict['repr2_feature_map']
-            stacked_feature_map = torch.concat([repr1_feature_map.unsqueeze(1), repr2_feature_map.unsqueeze(1)], dim=1)
             repr1_embedding = val_out_dict['repr1_embedding']
             repr2_embedding = val_out_dict['repr2_embedding']
             stacked_embedding = torch.concat([repr1_embedding.unsqueeze(1), repr2_embedding.unsqueeze(1)], dim=1)
-            val_loss_dict = self.loss_function(stacked_embedding, stacked_feature_map)
+            val_loss_dict = self.loss_function(stacked_embedding)
 
             loss_val = val_loss_dict['total_loss']
             self.log('val_CL_loss', loss_val.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_global_CL_loss', val_loss_dict['global_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
-            # self.log('val_dense_CL_loss', val_loss_dict['dense_CL_loss'], on_step=True, on_epoch=True, prog_bar=True)
 
             # Metrics
-            global_pos_sim_mean = val_loss_dict['global_pos_sim_mean']
-            global_neg_sim_mean = val_loss_dict['global_neg_sim_mean']
-            # dense_pos_sim_mean = val_loss_dict['dense_pos_sim_mean']
-            # dense_neg_sim_mean = val_loss_dict['dense_neg_sim_mean']
-            self.log('val_global_pos_sim_mean', global_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_global_neg_sim_mean', global_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            # self.log('val_dense_pos_sim_mean', dense_pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            # self.log('val_dense_neg_sim_mean', dense_neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            pos_sim_mean = val_loss_dict['pos_sim_mean']
+            neg_sim_mean = val_loss_dict['neg_sim_mean']
+            self.log('val_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
 
             return {
                 'loss': loss_val
@@ -177,31 +172,19 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             return recon_loss(pred=preds, gt=labels)
 
         def contrastive_loss_func(embeddings, feature_maps):
-            global_CL_loss_dict = global_multipos_info_nce(
+            CL_loss_dict = global_multipos_info_nce(
                 z=embeddings, 
-                temperature=self.global_multipos_info_nce_temperature, 
-                eps=self.global_multipos_info_nce_eps
+                temperature=self.info_nce_temperature, 
+                eps=self.info_nce_eps
             )
-            """dense_CL_loss_dict = dense_info_nce(
-                maps=feature_maps, 
-                temperature=self.dense_info_nce_temperature, 
-                include_spatial_negatives=self.dense_info_nce_include_spatial_negatives, 
-                neighborhood=self.dense_info_nce_neighborhood, 
-                eps=self.dense_info_nce_eps
-            )"""
 
-            total_loss = self.global_CL_lambda * global_CL_loss_dict['loss'] # + self.dense_CL_lambda * dense_CL_loss_dict['loss']
+            total_loss = self.CL_lambda * CL_loss_dict['loss']
 
             return {
-                'global_CL_loss': global_CL_loss_dict['loss'],
-                'global_pos_sim_mean': global_CL_loss_dict['pos_sim_mean'],
-                'global_neg_sim_mean': global_CL_loss_dict['neg_sim_mean'],
-                """'dense_CL_loss': dense_CL_loss_dict['loss'],
-                'dense_pos_sim_mean': dense_CL_loss_dict['pos_sim_mean'],
-                'dense_neg_sim_mean': dense_CL_loss_dict['neg_sim_mean'],"""
+                'pos_sim_mean': CL_loss_dict['pos_sim_mean'],
+                'neg_sim_mean': CL_loss_dict['neg_sim_mean'],
                 'total_loss': total_loss
             }
-
 
         if self.hparams.model_class_name == 'unimodal':
             return unimodal_loss_func
