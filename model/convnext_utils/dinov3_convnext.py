@@ -7,6 +7,8 @@ import logging
 from functools import partial
 from typing import Dict, List, Optional, Sequence, Union
 
+import argparse
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,13 +17,14 @@ from torch import Tensor, nn
 
 
 logger = logging.getLogger("dinov3")
+logging.basicConfig(level=logging.INFO)
 
 
 def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tensor:
     if drop_prob == 0.0 or not training:
         return x
     keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
     random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor.floor_()  # binarize
     output = x.div(keep_prob) * random_tensor
@@ -29,8 +32,6 @@ def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tens
 
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
-
     def __init__(self, drop_prob=None) -> None:
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
@@ -40,24 +41,13 @@ class DropPath(nn.Module):
 
 
 class Block(nn.Module):
-    r"""ConvNeXt Block. There are two equivalent implementations:
-    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-    We use (2) as we find it slightly faster in PyTorch
-
-    Args:
-        dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-
-    Source: https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
-    """
+    r"""ConvNeXt Block (channels_last MLP-style implementation)."""
 
     def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
         self.norm = LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = (
@@ -78,19 +68,12 @@ class Block(nn.Module):
         if self.gamma is not None:
             x = self.gamma * x
         x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
-
         x = input + self.drop_path(x)
         return x
 
 
 class LayerNorm(nn.Module):
-    r"""LayerNorm that supports two data formats: channels_last (default) or channels_first.
-    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs
-    with shape (batch_size, channels, height, width).
-
-    Source: https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
-    """
+    r"""LayerNorm supporting channels_last or channels_first."""
 
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
@@ -105,7 +88,7 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
+        else:
             u = x.mean(1, keepdim=True)
             s = (x - u).pow(2).mean(1, keepdim=True)
             x = (x - u) / torch.sqrt(s + self.eps)
@@ -115,30 +98,24 @@ class LayerNorm(nn.Module):
 
 class ConvNeXt(nn.Module):
     r"""
-    Code adapted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.pyConvNeXt
-
-    A PyTorch impl of : `A ConvNet for the 2020s`  -
-        https://arxiv.org/pdf/2201.03545.pdf
+    ConvNeXt backbone (DINOv3-style: no classifier head, returns both global & spatial features)
 
     Args:
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
-        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
-        drop_path_rate (float): Stochastic depth rate. Default: 0.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        patch_size (int | None): Pseudo patch size. Used to resize feature maps to those of a ViT with a given patch size. If None, no resizing is performed
+        in_chans (int): input channels
+        depths (list[int]): blocks per stage
+        dims (list[int]): channels per stage
+        drop_path_rate (float)
+        layer_scale_init_value (float)
+        patch_size (int|None): if set, patch tokens can be resized to ViT-like grid
     """
 
     def __init__(
         self,
-        # original ConvNeXt arguments
         in_chans: int = 3,
         depths: List[int] = [3, 3, 9, 3],
         dims: List[int] = [96, 192, 384, 768],
         drop_path_rate: float = 0.0,
         layer_scale_init_value: float = 1e-6,
-        # DINO arguments
         patch_size: int | None = None,
         **ignored_kwargs,
     ):
@@ -147,8 +124,8 @@ class ConvNeXt(nn.Module):
             logger.warning(f"Ignored kwargs: {ignored_kwargs}")
         del ignored_kwargs
 
-        # ==== ConvNeXt's original init =====
-        self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
+        # stem and 3 downsampling layers
+        self.downsample_layers = nn.ModuleList()
         stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
             LayerNorm(dims[0], eps=1e-6, data_format="channels_first"),
@@ -161,7 +138,8 @@ class ConvNeXt(nn.Module):
             )
             self.downsample_layers.append(downsample_layer)
 
-        self.stages = nn.ModuleList()  # 4 feature resolution stages, each consisting of multiple residual blocks
+        # stages
+        self.stages = nn.ModuleList()
         dp_rates = [x for x in np.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
         for i in range(4):
@@ -174,22 +152,24 @@ class ConvNeXt(nn.Module):
             self.stages.append(stage)
             cur += depths[i]
 
-        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)  # final norm layer
-        # ==== End of ConvNeXt's original init =====
+        # final norm (used as DINOv3-style projector norm, not classifier)
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
 
-        # ==== DINO adaptation ====
-        self.head = nn.Identity()  # remove classification head
+        # DINOv3 heads/metadata
+        self.head = nn.Identity()
         self.embed_dim = dims[-1]
-        self.embed_dims = dims  # per layer dimensions
-        self.n_blocks = len(self.downsample_layers)  # 4
+        self.embed_dims = dims
+        self.n_blocks = len(self.downsample_layers)
         self.chunked_blocks = False
-        self.n_storage_tokens = 0  # no registers
-
-        self.norms = nn.ModuleList([nn.Identity() for i in range(3)])
+        self.n_storage_tokens = 0
+        self.norms = nn.ModuleList([nn.Identity() for _ in range(3)])
         self.norms.append(self.norm)
 
         self.patch_size = patch_size
-        self.input_pad_size = 4  # first convolution with kernel_size = 4, stride = 4
+        self.input_pad_size = 4  # initial stride
+
+        # init
+        self.init_weights()
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -202,8 +182,10 @@ class ConvNeXt(nn.Module):
             module.bias = nn.Parameter(torch.zeros(module.normalized_shape))
         if isinstance(module, (nn.Conv2d, nn.Linear)):
             torch.nn.init.trunc_normal_(module.weight, std=0.02)
-            nn.init.constant_(module.bias, 0)
+            if getattr(module, "bias", None) is not None:
+                nn.init.constant_(module.bias, 0)
 
+    # ----- DINOv3-style feature API -----
     def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
         if isinstance(x, torch.Tensor):
             return self.forward_features_list([x], [masks])[0]
@@ -213,25 +195,22 @@ class ConvNeXt(nn.Module):
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         output = []
         for x, masks in zip(x_list, masks_list):
-            h, w = x.shape[-2:]
             for i in range(4):
                 x = self.downsample_layers[i](x)
                 x = self.stages[i](x)
-            x_pool = x.mean([-2, -1])  # global average pooling, (N, C, H, W) -> (N, C)
-            x = torch.flatten(x, 2).transpose(1, 2)
-
-            # concat [CLS] and patch tokens as (N, HW + 1, C), then normalize
-            x_norm = self.norm(torch.cat([x_pool.unsqueeze(1), x], dim=1))
+            # x is (B, C, Hf, Wf)
+            x_pool = x.mean(dim=(-2, -1))  # (B, C)
+            x_flat = torch.flatten(x, 2).transpose(1, 2)  # (B, Hf*Wf, C)
+            x_norm = self.norm(torch.cat([x_pool.unsqueeze(1), x_flat], dim=1))
             output.append(
                 {
-                    "x_norm_clstoken": x_norm[:, 0],
+                    "x_norm_clstoken": x_norm[:, 0],                         # (B, C)
                     "x_storage_tokens": x_norm[:, 1 : self.n_storage_tokens + 1],
-                    "x_norm_patchtokens": x_norm[:, self.n_storage_tokens + 1 :],
-                    "x_prenorm": x,
+                    "x_norm_patchtokens": x_norm[:, self.n_storage_tokens + 1 :],  # (B, Hf*Wf, C)
+                    "x_prenorm": x,                                          # (B, C, Hf, Wf)
                     "masks": masks,
                 }
             )
-
         return output
 
     def forward(self, *args, is_training=False, **kwargs):
@@ -241,6 +220,7 @@ class ConvNeXt(nn.Module):
         else:
             return self.head(ret["x_norm_clstoken"])
 
+    # helpers for intermediate layers (unused in this script, kept for completeness)
     def _get_intermediate_layers(self, x, n=1):
         h, w = x.shape[-2:]
         output, total_block_len = [], len(self.downsample_layers)
@@ -252,32 +232,22 @@ class ConvNeXt(nn.Module):
                 x_pool = x.mean([-2, -1])
                 x_patches = x
                 if self.patch_size is not None:
-                    # Resize output feature maps to that of a ViT with given patch_size
                     x_patches = nn.functional.interpolate(
-                        x,
-                        size=(h // self.patch_size, w // self.patch_size),
-                        mode="bilinear",
-                        antialias=True,
+                        x, size=(h // self.patch_size, w // self.patch_size), mode="bilinear", antialias=True
                     )
-                output.append(
-                    [
-                        x_pool,  # CLS (B x C)
-                        x_patches,  # B x C x H x W
-                    ]
-                )
+                output.append([x_pool, x_patches])
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
 
     def get_intermediate_layers(
         self,
         x,
-        n: Union[int, Sequence] = 1,  # Layers or n last layers to take,
+        n: Union[int, Sequence] = 1,
         reshape: bool = False,
         return_class_token: bool = False,
         norm: bool = True,
     ):
         outputs = self._get_intermediate_layers(x, n)
-
         if norm:
             nchw_shapes = [out[-1].shape for out in outputs]
             if isinstance(n, int):
@@ -286,8 +256,8 @@ class ConvNeXt(nn.Module):
                 norms = [self.norms[i] for i in n]
             outputs = [
                 (
-                    norm(cls_token),  # N x C
-                    norm(patches.flatten(-2, -1).permute(0, 2, 1)),  # N x HW x C
+                    norm(cls_token),
+                    norm(patches.flatten(-2, -1).permute(0, 2, 1)),
                 )
                 for (cls_token, patches), norm in zip(outputs, norms)
             ]
@@ -297,7 +267,6 @@ class ConvNeXt(nn.Module):
                     for (cls_token, patches), nchw in zip(outputs, nchw_shapes)
                 ]
         elif not reshape:
-            # force B x N x C format for patch tokens
             outputs = [(cls_token, patches.flatten(-2, -1).permute(0, 2, 1)) for (cls_token, patches) in outputs]
         class_tokens = [out[0] for out in outputs]
         outputs = [out[1] for out in outputs]
@@ -306,35 +275,225 @@ class ConvNeXt(nn.Module):
         return tuple(outputs)
 
 
-convnext_sizes = {
-    "tiny": dict(
-        depths=[3, 3, 9, 3],
-        dims=[96, 192, 384, 768],
-    ),
-    "small": dict(
-        depths=[3, 3, 27, 3],
-        dims=[96, 192, 384, 768],
-    ),
-    "base": dict(
-        depths=[3, 3, 27, 3],
-        dims=[128, 256, 512, 1024],
-    ),
-    "large": dict(
-        depths=[3, 3, 27, 3],
-        dims=[192, 384, 768, 1536],
-    ),
-}
 
 
-def get_convnext_arch(arch_name):
-    size_dict = None
-    query_sizename = arch_name.split("_")[1]
+def get_convnext_arch(arch_name: str):
+    """
+    arch_name format: 'convnext_tiny' | 'convnext_small' | 'convnext_base' | 'convnext_large'
+    """
+    convnext_sizes = {
+        "tiny": dict(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768]),
+        "small": dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768]),
+        "base": dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]),
+        "large": dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]),
+    }
     try:
+        query_sizename = arch_name.split("_")[1]
         size_dict = convnext_sizes[query_sizename]
-    except KeyError:
-        raise NotImplementedError("didn't recognize vit size string")
+    except Exception as e:
+        raise NotImplementedError(f"Unrecognized ConvNeXt size in '{arch_name}'.") from e
 
-    return partial(
-        ConvNeXt,
-        **size_dict,
-    )
+    return partial(ConvNeXt, **size_dict)
+
+
+class ProjectionHead(nn.Module):
+    """
+    Projects global embedding into a smaller unified embedding space for contrastive loss.
+    """
+    def __init__(self, in_dim: int, proj_dim: int = 128, hidden_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+    def forward(self, x):
+        # x: (B, in_dim)
+        return F.normalize(self.net(x), p=2, dim=1)
+
+
+class FlexibleDecoder(nn.Module):
+    """
+    Decode spatial feature map back to original image size (B, C_out, H, W).
+    Works for arbitrary input sizes by:
+      - repeated 2x upsampling with convs
+      - a final interpolate to the exact target size
+    """
+    def __init__(self, in_channels: int, out_channels: int = 3, hidden_channels: int = 256, max_upsamples: int = 6):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        # Build a stack of upsample+conv blocks; we can stop early in forward
+        up_blocks = []
+        for _ in range(max_upsamples):
+            up_blocks += [
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+            ]
+        self.up = nn.Sequential(*up_blocks)
+        self.head = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
+        self.max_upsamples = max_upsamples
+
+    def forward(self, x: Tensor, target_hw: tuple[int, int]) -> Tensor:
+        """
+        x: (B, C_in, Hf, Wf)
+        target_hw: (H, W) desired output spatial size (usually original image)
+        """
+        B, C, Hf, Wf = x.shape
+        Ht, Wt = target_hw
+        y = self.stem(x)
+
+        # figure out how many 2x steps we need (ceil to avoid under-upscaling)
+        scale_h = max(Ht / max(Hf, 1), 1.0)
+        scale_w = max(Wt / max(Wf, 1), 1.0)
+        steps = int(max(math.ceil(math.log2(scale_h)), math.ceil(math.log2(scale_w))))
+        steps = min(max(steps, 0), self.max_upsamples)
+
+        if steps > 0:
+            # run exactly 'steps' upsample blocks
+            # each step uses 3 modules inside self.up: Upsample, Conv2d, ReLU
+            modules_per_step = 3
+            up_to = steps * modules_per_step
+            y = self.up[:up_to](y)
+
+        # final precise resize + conv head
+        if (y.shape[-2], y.shape[-1]) != (Ht, Wt):
+            y = F.interpolate(y, size=(Ht, Wt), mode="bilinear", align_corners=False)
+        out = self.head(y)
+        return out
+
+
+class ContrastiveReconstructModel(nn.Module):
+    """
+    - Backbone: DINOv3-style ConvNeXt
+    - Projection head on global [CLS]-like embedding for contrastive alignment
+    - Decoder on spatial feature map for reconstruction
+    """
+    def __init__(self, 
+                 backbone_arch, 
+                 in_channels, 
+                 drop_path_rate, 
+                 layer_scale_init_value: float = 1e-6,
+                 patch_size: int = None,
+                 proj_dim: int = 128, 
+                 decoder_out_channels: int = 3,
+                ):
+        super().__init__()
+        self.backbone = build_backbone(backbone_arch, in_chans=in_channels, drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value, patch_size=patch_size)
+        backbone_out_dim = getattr(self.backbone, "embed_dim")
+        if backbone_out_dim is None:
+            raise ValueError("Backbone must expose 'embed_dim' for projection head.")
+        self.projection = ProjectionHead(in_dim=backbone_out_dim, proj_dim=proj_dim)
+        self.decoder = FlexibleDecoder(in_channels=backbone_out_dim, out_channels=decoder_out_channels)
+
+    @torch.no_grad()
+    def _infer_downsample(self, x_hw: tuple[int, int], feat_hw: tuple[int, int]) -> int:
+        # Useful sanity check if you want to inspect the pyramid factor
+        h, w = x_hw
+        hf, wf = feat_hw
+        if hf == 0 or wf == 0:
+            return 0
+        return int(round((h / hf + w / wf) * 0.5))
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        # x : (B, C, H, W)
+        feats = self.backbone.forward_features(x)  # dict
+        global_emb = feats["x_norm_clstoken"]      # (B, C)
+        spatial_feats = feats["x_prenorm"]         # (B, C, Hf, Wf)
+
+        z = self.projection(global_emb)            # (B, proj_dim)
+        recon = self.decoder(spatial_feats, target_hw=(x.shape[-2], x.shape[-1]))  # (B, outC, H, W)
+
+        return {"proj": z, "recon": recon, "global_emb": global_emb, "spatial_feats": spatial_feats}
+
+
+# ---------- Utilities to build backbone & (optionally) load pretrained ----------
+def build_backbone(arch: str, in_chans: int = 3, drop_path_rate: float = 0.0, layer_scale_init_value: float = 1e-6, patch_size: int = None) -> nn.Module:
+    ctor = get_convnext_arch(arch)
+    backbone = ctor(in_chans=in_chans, drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value, patch_size=patch_size)
+    return backbone
+
+
+# ---------- Self-contained testing main ----------
+def parse_args():
+    p = argparse.ArgumentParser(description="ContrastiveReconstructModel with DINOv3 ConvNeXt backbone")
+    p.add_argument("--backbone_arch", type=str, default="convnext_base",
+                   choices=["convnext_tiny", "convnext_small", "convnext_base", "convnext_large"],
+                   help="Backbone size.")
+    p.add_argument("--image-size", type=int, default=224, help="Square input size H=W.")
+    p.add_argument("--batch", type=int, default=4, help="Batch size for the dummy run.")
+    p.add_argument("--proj-dim", type=int, default=128, help="Projection head output dim.")
+    p.add_argument("--drop-path-rate", type=float, default=0.1, help="Stochastic depth rate.")
+    p.add_argument("--layer_scale_init_value", type=float, default=1e-6, help="layer_scale_init_value")
+    p.add_argument("--patch_size", type=int, default=16, help="Patch size")
+    p.add_argument("--decoder-out-ch", type=int, default=3, help="Decoder output channels.")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                   choices=["cpu", "cuda"])
+    p.add_argument("--in_channels", type=int, default=3, help="Input channels.")
+    return p.parse_args()
+
+def print_model_size(model):
+    # Calculate the size of the model in MB
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    size_all_bytes = param_size + buffer_size
+    size_all_mb = size_all_bytes / (1024**2)
+
+    print(f"Model size: {size_all_mb:.3f} MB")
+
+def main():
+    args = parse_args()
+    torch.manual_seed(0)
+
+    # Wrap into ContrastiveReconstructModel
+    model = ContrastiveReconstructModel(
+        backbone_arch=args.backbone_arch, 
+        in_channels=args.in_channels, 
+        drop_path_rate=args.drop_path_rate,
+        proj_dim=args.proj_dim,
+        decoder_out_channels=args.decoder_out_ch,
+        layer_scale_init_value=args.layer_scale_init_value,
+        patch_size=args.patch_size,
+    ).to(args.device)
+    model.eval()
+
+    # Dummy input
+    H = W = args.image_size
+    x = torch.randn(args.batch, args.in_channels, H, W, device=args.device)
+
+    with torch.no_grad():
+        out = model(x)
+
+    proj, recon, g, sf = out["proj"], out["recon"], out["global_emb"], out["spatial_feats"]
+
+    print_model_size(model)
+
+    # Print shapes
+    print("=== Test Run ===")
+    print(f"Backbone: {args.backbone_arch} | embed_dim={model.backbone.embed_dim}")
+    print(f"Input:          {tuple(x.shape)}")
+    print(f"Global emb:     {tuple(g.shape)}   (B, C)")
+    print(f"Projection z:   {tuple(proj.shape)} (B, {args.proj_dim})")
+    print(f"Spatial feats:  {tuple(sf.shape)}  (B, C, Hf, Wf)")
+    print(f"Reconstruction: {tuple(recon.shape)} (B, {args.decoder_out_ch}, H, W)")
+    # quick sanity: reconstruction spatial size matches input
+    assert recon.shape[-2:] == (H, W), "Decoder output spatial size must match input image size."
+    print("Sanity check passed: reconstruction spatial size matches input.")
+
+    # show downsample factor estimate (just for info)
+    ds_factor = model._infer_downsample((H, W), sf.shape[-2:])
+    print(f"Estimated downsample factor ~ x{ds_factor}")
+
+
+if __name__ == "__main__":
+    main()
