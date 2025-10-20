@@ -100,8 +100,8 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
         if self.model_class_name == 'unimodal':
             val_input = batch['repr_data'][0]
             val_out = self(val_input)
-            val_recon_loss = self.loss_function(val_out['x_hat'], val_input)
-            val_psnr = compute_psnr(val_out['x_hat'], val_input)
+            val_recon_loss = self.loss_function(val_out['recon'], val_input)
+            val_psnr = compute_psnr(val_out['recon'], val_input)
             self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
             self.log('val_psnr', val_psnr.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
 
