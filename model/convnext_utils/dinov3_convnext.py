@@ -310,74 +310,176 @@ class ProjectionHead(nn.Module):
         return F.normalize(self.net(x), p=2, dim=1)
 
 
-class ConvBNAct(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+class DWConvLarge(nn.Module):
+    """Depthwise 7x7 (large kernel) + pointwise conv; ConvNeXt-ish."""
+    def __init__(self, c, k=7, p=3):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
+        self.dw = nn.Conv2d(c, c, k, padding=p, groups=c, bias=False)
+        self.pw = nn.Conv2d(c, c, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c)
+        self.act = nn.GELU()
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.bn(x)
+        return self.act(x)
+
+
+class ConvNeXtLiteBlock(nn.Module):
+    """ConvNeXt-style MLP block with LayerScale + DropPath (channels_first)."""
+    def __init__(self, dim, mlp_ratio=4, drop_path=0.0, layer_scale_init_value=1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, int(mlp_ratio * dim))
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(int(mlp_ratio * dim), dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.dwconv(x)
+        x = x.permute(0,2,3,1)  # NCHW -> NHWC
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.gamma * x
+        x = x.permute(0,3,1,2)  # NHWC -> NCHW
+        return shortcut + self.drop_path(x)
+
+class AxialAttention2D(nn.Module):
+    """Lightweight axial attention along H and W (no shifting/window grid complexity)."""
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.h_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.w_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.proj = nn.Conv2d(dim, dim, 1, bias=False)
+
+    def forward(self, x):
+        # x: (B,C,H,W) -> (B*W,H,C) and (B*H,W,C)
+        B,C,H,W = x.shape
+        # H-axis
+        xh = x.permute(0,3,2,1).contiguous().view(B*W, H, C)  # (B*W, H, C)
+        xh, _ = self.h_attn(xh, xh, xh, need_weights=False)
+        xh = xh.view(B, W, H, C).permute(0,3,2,1)  # (B,C,H,W)
+
+        # W-axis
+        xw = x.permute(0,2,3,1).contiguous().view(B*H, W, C)  # (B*H, W, C)
+        xw, _ = self.w_attn(xw, xw, xw, need_weights=False)
+        xw = xw.view(B, H, W, C).permute(0,3,1,2)  # (B,C,W,H)->(B,C,H,W) after transpose
+
+        x = 0.5 * (xh + xw)
+        return self.proj(x)
+
+class UpFuse(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.in_proj = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.skip_proj = nn.Conv2d(skip_ch, out_ch, 1, bias=False)
         self.bn = nn.BatchNorm2d(out_ch)
         self.act = nn.GELU()
 
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class UpBlock(nn.Module):
-    """Upsample + fuse with skip, then refine."""
-    def __init__(self, in_ch, skip_ch, out_ch):
-        super().__init__()
-        self.proj = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
-        self.fuse = ConvBNAct(out_ch + skip_ch, out_ch, k=3, s=1, p=1)
-        self.refine = ConvBNAct(out_ch, out_ch, k=3, s=1, p=1)
-
     def forward(self, x, skip):
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.proj(x)
-        x = torch.cat([x, skip], dim=1)
-        x = self.fuse(x)
-        x = self.refine(x)
+        x = self.in_proj(x)
+        s = self.skip_proj(skip)
+        x = x + s
+        x = self.bn(x)
+        return self.act(x)
+
+
+class StageStack(nn.Module):
+    """Stack of ConvNeXtLiteBlocks, optional axial attention at the end."""
+    def __init__(self, dim, depth, use_axial_attn=False, num_heads=4,
+                 drop_path_rate=0.0, layer_scale_init_value=1e-6):
+        super().__init__()
+        dpr = torch.linspace(0, drop_path_rate, steps=max(depth,1)).tolist()
+        self.blocks = nn.Sequential(*[
+            ConvNeXtLiteBlock(dim, mlp_ratio=4, drop_path=dpr[i], layer_scale_init_value=layer_scale_init_value)
+            for i in range(depth)
+        ]) if depth > 0 else nn.Identity()
+        self.axial = AxialAttention2D(dim, num_heads=num_heads) if use_axial_attn else nn.Identity()
+
+    def forward(self, x):
+        x = self.blocks(x)
+        x = self.axial(x)
         return x
 
 
-class UNetPyramidDecoder(nn.Module):
+class UNetPyramidDecoderX(nn.Module):
     """
-    Strong decoder that uses the 4 ConvNeXt stages as UNet skips.
-    Expect 'pyramid' inputs: [C1@H/4, C2@H/8, C3@H/16, C4@H/32]
+    Scalable decoder with ConvNeXt-like blocks + optional axial attention.
+    Inputs: feats_pyr = [C1@H/4, C2@H/8, C3@H/16, C4@H/32]
     """
-    def __init__(self, in_channels_list: List[int], out_channels: int = 3, base_channels: int = 256):
+    def __init__(
+        self,
+        in_channels_list: List[int],        # [c1,c2,c3,c4] from backbone
+        out_channels: int = 3,
+        base_channels: int = 384,           # width scale: 256, 384, 512, ...
+        depths: tuple = (2, 2, 2, 2),       # (top_depth, up3_depth, up2_depth, up1_depth)
+        use_axial_attn: bool = True,
+        num_heads: int = 4,
+        drop_path_rate: float = 0.1,
+        layer_scale_init_value: float = 1e-6,
+    ):
         super().__init__()
-        assert len(in_channels_list) == 4, "Expected 4 feature maps from ConvNeXt."
+        assert len(in_channels_list) == 4
         c1, c2, c3, c4 = in_channels_list
 
-        # Top processing at the coarsest level
-        self.top = nn.Sequential(
-            ConvBNAct(c4, base_channels),
-            ConvBNAct(base_channels, base_channels),
+        # Top (coarsest) processing @ C4
+        self.top_in = nn.Conv2d(c4, base_channels, 1, bias=False)
+        self.top = StageStack(
+            base_channels, depths[0], use_axial_attn=use_axial_attn, num_heads=num_heads,
+            drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value
         )
 
-        # Up path: (c4 -> c3 -> c2 -> c1)
-        self.up3 = UpBlock(base_channels, c3, base_channels)         # fuse with C3
-        self.up2 = UpBlock(base_channels, c2, base_channels // 2)    # fuse with C2
-        self.up1 = UpBlock(base_channels // 2, c1, base_channels // 4)  # fuse with C1
+        # Up: C4->C3->C2->C1 with widths reducing
+        c_up3 = base_channels                         # H/16
+        c_up2 = max(base_channels // 2, 128)          # H/8
+        c_up1 = max(base_channels // 4, 96)           # H/4
 
-        # Light head
+        self.fuse3 = UpFuse(c_up3, c3, c_up3)
+        self.stage3 = StageStack(
+            c_up3, depths[1], use_axial_attn=use_axial_attn, num_heads=num_heads,
+            drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value
+        )
+
+        self.fuse2 = UpFuse(c_up3, c2, c_up2)
+        self.stage2 = StageStack(
+            c_up2, depths[2], use_axial_attn=use_axial_attn, num_heads=num_heads,
+            drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value
+        )
+
+        self.fuse1 = UpFuse(c_up2, c1, c_up1)
+        self.stage1 = StageStack(
+            c_up1, depths[3], use_axial_attn=use_axial_attn, num_heads=num_heads,
+            drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value
+        )
+
+        # Head
         self.head = nn.Sequential(
-            ConvBNAct(base_channels // 4, base_channels // 4),
-            nn.Conv2d(base_channels // 4, out_channels, kernel_size=3, padding=1)
+            DWConvLarge(c_up1, k=7, p=3),
+            nn.Conv2d(c_up1, out_channels, kernel_size=1)
         )
 
     def forward(self, feats_pyramid: List[Tensor], target_hw: tuple[int, int]) -> Tensor:
-        """
-        feats_pyramid: [f1, f2, f3, f4] with spatial sizes ~ [H/4, H/8, H/16, H/32]
-        """
-        f1, f2, f3, f4 = feats_pyramid
-        x = self.top(f4)                 # start at coarsest
-        x = self.up3(x, f3)              # -> ~H/16
-        x = self.up2(x, f2)              # -> ~H/8
-        x = self.up1(x, f1)              # -> ~H/4
-        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
-        x = self.head(x)
-        return x
+        f1, f2, f3, f4 = feats_pyramid  # C1..C4
+        x = self.top_in(f4)
+        x = self.top(x)
 
+        x = self.fuse3(x, f3)
+        x = self.stage3(x)
+
+        x = self.fuse2(x, f2)
+        x = self.stage2(x)
+
+        x = self.fuse1(x, f1)
+        x = self.stage1(x)
+
+        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        return self.head(x)
 
 
 class ContrastiveReconstructModel(nn.Module):
@@ -413,10 +515,15 @@ class ContrastiveReconstructModel(nn.Module):
         else:
             self.projection = None
             # NEW: UNet-style decoder with ConvNeXt stage channels
-            self.decoder = UNetPyramidDecoder(
+            self.decoder = UNetPyramidDecoderX(
                 in_channels_list=self.backbone.embed_dims,
                 out_channels=decoder_out_channels,
-                base_channels=256
+                base_channels=512,            # try 256/384/512/640 depending on GPU
+                depths=(3, 5, 5, 3),          # (top, up3, up2, up1) — increase to 3–5 per stage for stronger
+                use_axial_attn=True,          # set False for pure ConvNeXt-style if you want max speed
+                num_heads=8,                  # increase with width; 4/6/8 are common
+                drop_path_rate=0.2,           # match or exceed backbone dpr for regularization
+                layer_scale_init_value=1e-6,
             )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
