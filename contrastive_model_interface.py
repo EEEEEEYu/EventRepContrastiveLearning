@@ -65,10 +65,14 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
         if self.model_class_name == 'unimodal':
             train_input = batch['repr_data'][0]
             train_out = self(train_input)
-            train_recon_loss = self.loss_function(train_out['x_hat'], train_input)
-            train_psnr = compute_psnr(train_out['x_hat'], train_input)
-            self.log('train_recon_loss', train_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('train_psnr', train_psnr.item(), on_step=True, on_epoch=True, prog_bar=True)
+            train_recon_loss = self.loss_function(train_out['recon'], train_input)
+            train_psnr = compute_psnr(train_out['recon'], train_input)
+            self.log('train_recon_loss', train_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=train_input.shape[0])
+            self.log('train_psnr', train_psnr.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=train_input.shape[0])
+
+            return {
+                'loss': train_recon_loss
+            }
 
         elif self.model_class_name == 'pairwise':
             train_input = batch
@@ -79,13 +83,13 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             train_loss_dict = self.loss_function(stacked_embedding)
 
             loss_train = train_loss_dict['total_loss']
-            self.log('train_CL_loss', loss_train.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_CL_loss', loss_train.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=train_input.shape[0])
 
             # Metrics
             pos_sim_mean = train_loss_dict['pos_sim_mean']
             neg_sim_mean = train_loss_dict['neg_sim_mean']
-            self.log('train_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('train_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('train_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=train_input.shape[0])
+            self.log('train_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=train_input.shape[0])
 
             return {
                 'loss': loss_train
@@ -98,8 +102,12 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             val_out = self(val_input)
             val_recon_loss = self.loss_function(val_out['x_hat'], val_input)
             val_psnr = compute_psnr(val_out['x_hat'], val_input)
-            self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_psnr', val_psnr.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_recon_loss', val_recon_loss.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
+            self.log('val_psnr', val_psnr.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
+
+            return {
+                'loss': val_recon_loss
+            }
             
         elif self.model_class_name == 'pairwise':
             val_input = batch
@@ -110,13 +118,13 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             val_loss_dict = self.loss_function(stacked_embedding)
 
             loss_val = val_loss_dict['total_loss']
-            self.log('val_CL_loss', loss_val.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_CL_loss', loss_val.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
 
             # Metrics
             pos_sim_mean = val_loss_dict['pos_sim_mean']
             neg_sim_mean = val_loss_dict['neg_sim_mean']
-            self.log('val_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
-            self.log('val_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log('val_pos_sim_mean', pos_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
+            self.log('val_neg_sim_mean', neg_sim_mean.item(), on_step=True, on_epoch=True, prog_bar=True, batch_size=val_input.shape[0])
 
             return {
                 'loss': loss_val
@@ -203,7 +211,7 @@ class ContrastiveLearningModelInterface(pl.LightningModule):
             raise ValueError(f'Invalid Module File Name or Invalid Class Name {name}.{camel_name}!')
         model = self.__instantiate(model_class)
         if self.hparams.use_compile:
-            torch.compile(model)
+            model = torch.compile(model)
         return model
 
     def __instantiate(self, model_class, **other_args):

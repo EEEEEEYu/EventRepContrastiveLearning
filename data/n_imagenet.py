@@ -83,7 +83,7 @@ class NImageNet(Dataset):
             return events_t, events_xy, events_p
 
     def __len__(self):
-        return self.prefix_count[-1] if len(self.prefix_count) > 0 else 0
+        return 100 if len(self.prefix_count) > 0 else 0
 
     def __getitem__(self, idx):
         npz_path = self.get_path_from_global_idx(idx)

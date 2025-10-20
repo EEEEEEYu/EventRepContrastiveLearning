@@ -3,7 +3,6 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-import logging
 from functools import partial
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -14,10 +13,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn.init
 from torch import Tensor, nn
-
-
-logger = logging.getLogger("dinov3")
-logging.basicConfig(level=logging.INFO)
 
 
 def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tensor:
@@ -120,9 +115,6 @@ class ConvNeXt(nn.Module):
         **ignored_kwargs,
     ):
         super().__init__()
-        if len(ignored_kwargs) > 0:
-            logger.warning(f"Ignored kwargs: {ignored_kwargs}")
-        del ignored_kwargs
 
         # stem and 3 downsampling layers
         self.downsample_layers = nn.ModuleList()
@@ -195,10 +187,13 @@ class ConvNeXt(nn.Module):
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         output = []
         for x, masks in zip(x_list, masks_list):
+            feats = []
             for i in range(4):
                 x = self.downsample_layers[i](x)
                 x = self.stages[i](x)
-            # x is (B, C, Hf, Wf)
+                feats.append(x)  # collect after each stage
+
+            # x is last stage (B, C4, H/32, W/32). feats = [C1@H/4, C2@H/8, C3@H/16, C4@H/32]
             x_pool = x.mean(dim=(-2, -1))  # (B, C)
             x_flat = torch.flatten(x, 2).transpose(1, 2)  # (B, Hf*Wf, C)
             x_norm = self.norm(torch.cat([x_pool.unsqueeze(1), x_flat], dim=1))
@@ -207,11 +202,13 @@ class ConvNeXt(nn.Module):
                     "x_norm_clstoken": x_norm[:, 0],                         # (B, C)
                     "x_storage_tokens": x_norm[:, 1 : self.n_storage_tokens + 1],
                     "x_norm_patchtokens": x_norm[:, self.n_storage_tokens + 1 :],  # (B, Hf*Wf, C)
-                    "x_prenorm": x,                                          # (B, C, Hf, Wf)
+                    "x_prenorm": x,                                          # (B, C4, H/32, W/32)
+                    "pyramid": feats,                                        # list of 4 feature maps
                     "masks": masks,
                 }
             )
         return output
+
 
     def forward(self, *args, is_training=False, **kwargs):
         ret = self.forward_features(*args, **kwargs)
@@ -313,58 +310,74 @@ class ProjectionHead(nn.Module):
         return F.normalize(self.net(x), p=2, dim=1)
 
 
-class FlexibleDecoder(nn.Module):
-    """
-    Decode spatial feature map back to original image size (B, C_out, H, W).
-    Works for arbitrary input sizes by:
-      - repeated 2x upsampling with convs
-      - a final interpolate to the exact target size
-    """
-    def __init__(self, in_channels: int, out_channels: int = 3, hidden_channels: int = 256, max_upsamples: int = 6):
+class ConvBNAct(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class UpBlock(nn.Module):
+    """Upsample + fuse with skip, then refine."""
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.proj = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.fuse = ConvBNAct(out_ch + skip_ch, out_ch, k=3, s=1, p=1)
+        self.refine = ConvBNAct(out_ch, out_ch, k=3, s=1, p=1)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.proj(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.fuse(x)
+        x = self.refine(x)
+        return x
+
+
+class UNetPyramidDecoder(nn.Module):
+    """
+    Strong decoder that uses the 4 ConvNeXt stages as UNet skips.
+    Expect 'pyramid' inputs: [C1@H/4, C2@H/8, C3@H/16, C4@H/32]
+    """
+    def __init__(self, in_channels_list: List[int], out_channels: int = 3, base_channels: int = 256):
+        super().__init__()
+        assert len(in_channels_list) == 4, "Expected 4 feature maps from ConvNeXt."
+        c1, c2, c3, c4 = in_channels_list
+
+        # Top processing at the coarsest level
+        self.top = nn.Sequential(
+            ConvBNAct(c4, base_channels),
+            ConvBNAct(base_channels, base_channels),
         )
-        # Build a stack of upsample+conv blocks; we can stop early in forward
-        up_blocks = []
-        for _ in range(max_upsamples):
-            up_blocks += [
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-            ]
-        self.up = nn.Sequential(*up_blocks)
-        self.head = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
-        self.max_upsamples = max_upsamples
 
-    def forward(self, x: Tensor, target_hw: tuple[int, int]) -> Tensor:
+        # Up path: (c4 -> c3 -> c2 -> c1)
+        self.up3 = UpBlock(base_channels, c3, base_channels)         # fuse with C3
+        self.up2 = UpBlock(base_channels, c2, base_channels // 2)    # fuse with C2
+        self.up1 = UpBlock(base_channels // 2, c1, base_channels // 4)  # fuse with C1
+
+        # Light head
+        self.head = nn.Sequential(
+            ConvBNAct(base_channels // 4, base_channels // 4),
+            nn.Conv2d(base_channels // 4, out_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, feats_pyramid: List[Tensor], target_hw: tuple[int, int]) -> Tensor:
         """
-        x: (B, C_in, Hf, Wf)
-        target_hw: (H, W) desired output spatial size (usually original image)
+        feats_pyramid: [f1, f2, f3, f4] with spatial sizes ~ [H/4, H/8, H/16, H/32]
         """
-        B, C, Hf, Wf = x.shape
-        Ht, Wt = target_hw
-        y = self.stem(x)
+        f1, f2, f3, f4 = feats_pyramid
+        x = self.top(f4)                 # start at coarsest
+        x = self.up3(x, f3)              # -> ~H/16
+        x = self.up2(x, f2)              # -> ~H/8
+        x = self.up1(x, f1)              # -> ~H/4
+        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        x = self.head(x)
+        return x
 
-        # figure out how many 2x steps we need (ceil to avoid under-upscaling)
-        scale_h = max(Ht / max(Hf, 1), 1.0)
-        scale_w = max(Wt / max(Wf, 1), 1.0)
-        steps = int(max(math.ceil(math.log2(scale_h)), math.ceil(math.log2(scale_w))))
-        steps = min(max(steps, 0), self.max_upsamples)
-
-        if steps > 0:
-            # run exactly 'steps' upsample blocks
-            # each step uses 3 modules inside self.up: Upsample, Conv2d, ReLU
-            modules_per_step = 3
-            up_to = steps * modules_per_step
-            y = self.up[:up_to](y)
-
-        # final precise resize + conv head
-        if (y.shape[-2], y.shape[-1]) != (Ht, Wt):
-            y = F.interpolate(y, size=(Ht, Wt), mode="bilinear", align_corners=False)
-        out = self.head(y)
-        return out
 
 
 class ContrastiveReconstructModel(nn.Module):
@@ -374,39 +387,50 @@ class ContrastiveReconstructModel(nn.Module):
     - Decoder on spatial feature map for reconstruction
     """
     def __init__(self, 
-                 backbone_arch, 
                  in_channels, 
-                 drop_path_rate, 
+                 backbone_arch: str = "convnext_base", 
+                 encoder_only: bool = False,
+                 drop_path_rate: float = 0.1, 
                  layer_scale_init_value: float = 1e-6,
                  patch_size: int = None,
                  proj_dim: int = 128, 
                  decoder_out_channels: int = 3,
-                ):
+                 ):
         super().__init__()
-        self.backbone = build_backbone(backbone_arch, in_chans=in_channels, drop_path_rate=drop_path_rate, layer_scale_init_value=layer_scale_init_value, patch_size=patch_size)
+        self.backbone = build_backbone(
+            backbone_arch, in_chans=in_channels,
+            drop_path_rate=drop_path_rate,
+            layer_scale_init_value=layer_scale_init_value,
+            patch_size=patch_size
+        )
         backbone_out_dim = getattr(self.backbone, "embed_dim")
         if backbone_out_dim is None:
             raise ValueError("Backbone must expose 'embed_dim' for projection head.")
-        self.projection = ProjectionHead(in_dim=backbone_out_dim, proj_dim=proj_dim)
-        self.decoder = FlexibleDecoder(in_channels=backbone_out_dim, out_channels=decoder_out_channels)
-
-    @torch.no_grad()
-    def _infer_downsample(self, x_hw: tuple[int, int], feat_hw: tuple[int, int]) -> int:
-        # Useful sanity check if you want to inspect the pyramid factor
-        h, w = x_hw
-        hf, wf = feat_hw
-        if hf == 0 or wf == 0:
-            return 0
-        return int(round((h / hf + w / wf) * 0.5))
+        self.encoder_only = encoder_only
+        if self.encoder_only:
+            self.projection = ProjectionHead(in_dim=backbone_out_dim, proj_dim=proj_dim)
+            self.decoder = None
+        else:
+            self.projection = None
+            # NEW: UNet-style decoder with ConvNeXt stage channels
+            self.decoder = UNetPyramidDecoder(
+                in_channels_list=self.backbone.embed_dims,
+                out_channels=decoder_out_channels,
+                base_channels=256
+            )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        # x : (B, C, H, W)
-        feats = self.backbone.forward_features(x)  # dict
-        global_emb = feats["x_norm_clstoken"]      # (B, C)
-        spatial_feats = feats["x_prenorm"]         # (B, C, Hf, Wf)
+        feats = self.backbone.forward_features(x)  # dict (now includes "pyramid")
+        global_emb = feats["x_norm_clstoken"]
+        spatial_feats = feats["x_prenorm"]
+        pyramid = feats["pyramid"]
 
-        z = self.projection(global_emb)            # (B, proj_dim)
-        recon = self.decoder(spatial_feats, target_hw=(x.shape[-2], x.shape[-1]))  # (B, outC, H, W)
+        if self.encoder_only:
+            z = self.projection(global_emb)
+            recon = None
+        else:
+            z = None
+            recon = self.decoder(pyramid, target_hw=(x.shape[-2], x.shape[-1]))
 
         return {"proj": z, "recon": recon, "global_emb": global_emb, "spatial_feats": spatial_feats}
 
@@ -424,6 +448,7 @@ def parse_args():
     p.add_argument("--backbone_arch", type=str, default="convnext_base",
                    choices=["convnext_tiny", "convnext_small", "convnext_base", "convnext_large"],
                    help="Backbone size.")
+    p.add_argument("--encoder_only", action="store_true", help="Square input size H=W.")
     p.add_argument("--image-size", type=int, default=224, help="Square input size H=W.")
     p.add_argument("--batch", type=int, default=4, help="Batch size for the dummy run.")
     p.add_argument("--proj-dim", type=int, default=128, help="Projection head output dim.")
@@ -459,6 +484,7 @@ def main():
     model = ContrastiveReconstructModel(
         backbone_arch=args.backbone_arch, 
         in_channels=args.in_channels, 
+        encoder_only=args.encoder_only,
         drop_path_rate=args.drop_path_rate,
         proj_dim=args.proj_dim,
         decoder_out_channels=args.decoder_out_ch,
@@ -483,11 +509,12 @@ def main():
     print(f"Backbone: {args.backbone_arch} | embed_dim={model.backbone.embed_dim}")
     print(f"Input:          {tuple(x.shape)}")
     print(f"Global emb:     {tuple(g.shape)}   (B, C)")
-    print(f"Projection z:   {tuple(proj.shape)} (B, {args.proj_dim})")
+    print(f"Projection z:   {tuple(proj.shape) if proj is not None else None} (B, {args.proj_dim})")
     print(f"Spatial feats:  {tuple(sf.shape)}  (B, C, Hf, Wf)")
-    print(f"Reconstruction: {tuple(recon.shape)} (B, {args.decoder_out_ch}, H, W)")
+    print(f"Reconstruction: {tuple(recon.shape) if recon is not None else None} (B, {args.decoder_out_ch}, H, W)")
     # quick sanity: reconstruction spatial size matches input
-    assert recon.shape[-2:] == (H, W), "Decoder output spatial size must match input image size."
+    if not args.encoder_only:
+        assert recon.shape[-2:] == (H, W), "Decoder output spatial size must match input image size."
     print("Sanity check passed: reconstruction spatial size matches input.")
 
     # show downsample factor estimate (just for info)

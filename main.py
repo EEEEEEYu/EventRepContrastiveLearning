@@ -85,7 +85,7 @@ def load_callbacks(config):
 
     # Monitor a metric and stop training when it stops improving
     callbacks.append(plc.EarlyStopping(
-        monitor='val_loss_epoch',
+        monitor='train_recon_loss_epoch',
         mode='min',
         patience=10,
         min_delta=0.001
@@ -96,7 +96,7 @@ def load_callbacks(config):
         # Best & Last checkpoint
         callbacks.append(plc.ModelCheckpoint(
             every_n_epochs=1,
-            monitor='val_loss_epoch',
+            monitor='train_recon_loss_epoch',
             mode='min',
             filename='best-{epoch:03d}-{val_loss_epoch:.5f}',
             save_top_k=1,

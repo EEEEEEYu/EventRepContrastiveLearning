@@ -1,46 +1,35 @@
 import torch
 import torch.nn as nn
 
-from model.convnext_utils.convnext_blocks import ConvNeXtAutoEncoder
+from model.convnext_utils.dinov3_convnext import ContrastiveReconstructModel
 
 class Unimodal(nn.Module):
     def __init__(
             self,
             representation_names,
-            height,
-            width,
-            in_channels,
-            latent_size,
-            latent_channels,
-            stage_depths,
-            base_channels,
-            channel_multipliers,
-            drop_path_rate,
-            use_grn,
+            in_channels, 
+            backbone_arch: str = "convnext_base", 
+            encoder_only: bool = False,
+            drop_path_rate: float = 0.1, 
+            layer_scale_init_value: float = 1e-6,
+            patch_size: int = None,
+            proj_dim: int = 128, 
+            decoder_out_channels: int = 3,
         ):
         super().__init__()
 
         self.representation_names = representation_names
 
-        self.autoencoder = ConvNeXtAutoEncoder(
+        self.autoencoder = ContrastiveReconstructModel(
             in_channels=in_channels,
-            in_size=(height, width),
-            target_size=latent_size,
-            latent_channels=latent_channels,
-            out_channels=in_channels,
-            stage_depths=stage_depths,
-            base_channels=base_channels,
-            channel_multipliers=channel_multipliers,
+            backbone_arch=backbone_arch,
+            encoder_only=encoder_only,
             drop_path_rate=drop_path_rate,
-            use_grn=use_grn,
+            layer_scale_init_value=layer_scale_init_value,
+            patch_size=patch_size,
+            proj_dim=proj_dim,
+            decoder_out_channels=decoder_out_channels,
         )
 
-    def encoder_forward(self, x):
-        return self.autoencoder.encoder_forward(x)
-
     def forward(self, x):
-        latent, x_hat = self.autoencoder(x)
-        return {
-            'latent': latent,
-            'x_hat': x_hat,
-        }
+        return self.autoencoder(x)
