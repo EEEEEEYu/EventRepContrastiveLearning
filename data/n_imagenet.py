@@ -11,10 +11,20 @@ class NImageNet(Dataset):
         self.split = split
 
         # Part_1 ... Part_10
-        parts_prefixes = [
-            os.path.join(self.dataset_dir, split, f"Part_{i}") for i in range(1, 11)
-            if os.path.exists(os.path.join(self.dataset_dir, split, f"Part_{i}"))
-        ]
+        if split == 'train':
+            parts_prefixes = [
+                os.path.join(self.dataset_dir, split, f"Part_{i}") for i in range(1, 11)
+                if os.path.exists(os.path.join(self.dataset_dir, split, f"Part_{i}"))
+            ]
+        else:
+            """folder_names = ['extracted_val', 'extracted_val_brighness_4', 'extracted_val_brighness_5',
+                             'extracted_val_brighness_6', 'extracted_val_brighness_7', 'extracted_val_mode_1', 
+                             'extracted_val_mode_3', 'extracted_val_mode_5', 'extracted_val_mode_6', 'extracted_val_mode_7']"""
+            folder_names = ['extracted_val']
+            parts_prefixes = [
+                os.path.join(self.dataset_dir, split, name) for name in folder_names
+                if os.path.join(self.dataset_dir, split, name)
+            ]
 
         # Each class folder under each Part
         class_folder_prefixes = []
