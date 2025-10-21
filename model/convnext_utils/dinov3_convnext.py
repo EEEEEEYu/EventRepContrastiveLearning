@@ -363,12 +363,12 @@ class AxialAttention2D(nn.Module):
         # H-axis
         xh = x.permute(0,3,2,1).contiguous().view(B*W, H, C)  # (B*W, H, C)
         xh, _ = self.h_attn(xh, xh, xh, need_weights=False)
-        xh = xh.view(B, W, H, C).permute(0,3,2,1)  # (B,C,H,W)
+        xh = xh.view(B, W, H, C).permute(0,3,2,1).contiguous()  # (B,C,H,W)
 
         # W-axis
         xw = x.permute(0,2,3,1).contiguous().view(B*H, W, C)  # (B*H, W, C)
         xw, _ = self.w_attn(xw, xw, xw, need_weights=False)
-        xw = xw.view(B, H, W, C).permute(0,3,1,2)  # (B,C,W,H)->(B,C,H,W) after transpose
+        xw = xw.view(B, H, W, C).permute(0,3,1,2).contiguous()  # (B,C,W,H)->(B,C,H,W) after transpose
 
         x = 0.5 * (xh + xw)
         return self.proj(x)
